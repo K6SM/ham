@@ -1,5 +1,6 @@
-# ham
-Amateur Radio support for Emacs
+# ham.el
+
+Amateur radio support for Emacs, by K6SM.
 
 `ham-rig.el` gives you a transceiver control panel in a buffer: frequency, mode,
 passband, VFO, split, an S-meter while receiving, and ALC and SWR while
@@ -16,7 +17,7 @@ Everything here works in a terminal. None of it requires a graphical Emacs.
 | --- | --- |
 | `ham.el` | Base library: event bus, async TCP transport, geodesy, band plan. |
 | `ham-rig.el` | Transceiver control panel, speaking to `rigctld`. |
-| `test/` | 90 unit tests and 19 end-to-end tests. |
+| `test/` | 147 unit tests and 27 end-to-end tests. |
 
 The prefix is `ham-`. `ham.el` owns the bare `ham-` prefix and `ham-rig.el` owns
 `ham-rig-`, following the `org.el` / `org-agenda.el` pattern. Further packages
@@ -86,6 +87,10 @@ Keys in the panel:
 
 | Key | Action |
 | --- | --- |
+| `↑` / `↓` | Tune up / down one step. |
+| `M-↑` / `M-↓` | Tune ten steps. `PgUp` / `PgDn` do the same. |
+| `←` / `→` | Smaller / larger tuning step. |
+| `.` | Pick a tuning step by name. |
 | `f` | Set frequency. Accepts `14074`, `14.074` or `14.074.000`. |
 | `m` | Set mode, completing over the modes the radio reports. |
 | `b` | Move to a band, using `ham-band-default-frequencies`. |
@@ -95,14 +100,74 @@ Keys in the panel:
 | `T` | Panic unkey — drops the queue and unkeys immediately. |
 | `g` | Force an immediate poll of everything. |
 | `c` / `d` | Connect / disconnect. |
+| `C` | Open the controls panel. |
 | `?` | Show the capabilities the radio reported. |
 | `S` | Show link statistics: request count, timeouts, errors, latency, queue depth. |
 | `L` | Show the diagnostic log (needs `ham-debug`). |
+
+### Tuning
+
+The arrow keys work like a tuning knob with a step button. `↑` and `↓` move by
+the current step, `←` and `→` change what that step is, and the panel shows it
+next to the band. Steps come from `ham-rig-tuning-steps` and run from 1 Hz to
+1 MHz by default; `ham-rig-default-tuning-step` picks the one you start on.
+
+The readout moves the instant you press a key rather than waiting for the next
+poll, so holding a key feels continuous. The poll that follows replaces the
+displayed value with whatever the radio actually settled on, which is what
+corrects for a rig that quantises to its own step. Only the most recent
+frequency is ever sent: a held key does not queue up hundreds of sets for the
+link to replay after you stop.
 
 `M-x ham-rig-show-stats` is worth watching when you first connect a real radio.
 Mean and maximum round-trip latency and queue depth tell you whether the default
 0.2 second fast poll interval is sensible at your CAT rate; if latency is
 climbing or the queue is not draining, raise `ham-rig-fast-interval`.
+
+## Controls
+
+`C` in the panel, or `M-x ham-rig-controls`, opens a list of everything the
+radio can adjust: IF shift, notch, TX power, noise reduction, noise blanker,
+CW speed, mic gain, VOX gain and delay, monitor level, compression, break-in
+delay, CW pitch, preamp, attenuator, squelch, AF and RF gain, and switches for
+the tuner, VOX, ANF, APF, manual notch, RIT and the rest.
+
+| Key | Action |
+| --- | --- |
+| `←` / `→` | Adjust the control on this line, or toggle it if it is a switch. |
+| `M-←` / `M-→` | Adjust by ten steps. `-` and `+` work too. |
+| `RET` / `SPC` | Toggle a switch, or prompt for a level. |
+| `=` | Type an exact value. |
+| `g` | Re-read everything. |
+
+Nothing in that list is written down anywhere in this package. It is built from
+what the radio reports through `\dump_caps`, which describes each level as
+`NAME(min..max/step)` — so the ranges, the increments and the number of decimal
+places all come from the rig, and a different radio produces a different panel
+with no code change. Read-only meters are recognised by appearing under
+Hamlib's `Get level` but not `Set level`, and are kept out of a panel whose
+purpose is changing things.
+
+Two consequences worth knowing:
+
+- **Hamlib normalises many levels to 0..1** rather than the radio's own units.
+  TX power and mic gain read as fractions, not watts or the number on the front
+  panel.
+- **A control Hamlib describes as `0..0/0` is omitted**, because there is
+  nothing to adjust. On the FTDX10 that is AGC and METER: the radio has an AGC,
+  but it takes named settings rather than a number and Hamlib does not describe
+  it as a range here.
+
+Roofing filter and contour are not offered because the FTDX10 backend does not
+expose them as either a level or a function. Reaching them would mean sending
+raw CAT, which is specific to one radio and is a deliberate departure from
+everything else here.
+
+Controls are re-read a few at a time rather than all at once — a rig with forty
+of them would otherwise need forty extra requests a second on top of the
+frequency and meter polls, which a serial link cannot carry. Opening the panel
+reads everything once so it fills immediately; after that the round robin keeps
+it current, and any control you change is re-read straight away.
 
 ## Transmit safety
 
@@ -134,6 +199,8 @@ most worth knowing:
 | `ham-rig-slow-interval` | `1.0` | Seconds between mode, VFO, split, SWR and ALC polls. |
 | `ham-rig-tx-timeout` | `180` | Watchdog unkey, in seconds. |
 | `ham-rig-poll-when-hidden` | `nil` | Keep polling with no panel visible and nothing subscribed. |
+| `ham-rig-controls-poll-batch` | `4` | Controls re-read per slow poll. |
+| `ham-rig-controls-exclude` | `nil` | Control names to leave out of the panel. |
 | `ham-frequency-format` | `dotted` | `14.074.000`, or `khz`, or `mhz`. |
 | `ham-band-default-frequencies` | digital calling frequencies | Where `b` takes you on each band. |
 | `ham-debug` | `nil` | Log every line in and out to `*ham-log*`. |
@@ -204,3 +271,39 @@ parser, because all three are easy to get wrong and fail silently:
   holds the single in-flight slot until the request times out.
 - Hamlib does not echo back the VFO name that was set. Ask for `VFOB` and a rig
   with two receivers reports `Sub`, so VFO identity is compared by side.
+
+## Testing
+
+```
+make check     # byte-compile with warnings as errors, checkdoc, then both suites
+make test      # 147 unit tests, no radio and no rigctld needed
+make live      # 27 end-to-end tests against a real rigctld
+make compile   # byte-compile only
+```
+
+`make live` starts its own `rigctld -m 1 -P RIG` on a free port and drives it
+over a real socket, so it needs Hamlib installed but no radio. It skips itself
+if `rigctld` is not on `PATH`. `-P RIG` is required because the dummy rig
+otherwise refuses to key, which would leave the transmit path untested.
+
+Batch Emacs has no command loop, so the poll timers never fire on their own; the
+live harness dispatches due timers by hand.
+
+## Status
+
+Both files byte-compile cleanly with warnings as errors, pass `checkdoc` and
+`package-lint`, and pass 174 tests including end-to-end tests against a real
+`rigctld`.
+
+Read and control of frequency, mode, passband, VFO, split, PTT and the meters
+is confirmed working against an FTDX10. The controls panel is built from that
+radio's reported capabilities and tested against them, but has so far been
+exercised against Hamlib's dummy backend rather than against the radio itself.
+
+VFO mode (`rigctld -o`) is detected and warned about, but not supported:
+commands would need to carry an explicit VFO argument. Run `rigctld` without
+`-o`.
+
+## Licence
+
+GPL-3.0-or-later, matching Emacs.

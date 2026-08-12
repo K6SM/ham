@@ -6,7 +6,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
-;; URL: https://github.com/K6SM/ham
+;; URL: https://github.com/K6SM/ham.el
 
 ;; This file is not part of GNU Emacs.
 
@@ -269,7 +269,7 @@ connection is not opened; call `ham-connection-open'."
                           :backoff ham-reconnect-initial-delay))
 
 (defun ham-connection-open (conn)
-  "Open CONN asynchronously.  Return CONN."
+  "Open CONN asynchronously.  Returns CONN."
   (when (ham-connection-process conn)
     (ignore-errors (delete-process (ham-connection-process conn))))
   (setf (ham-connection-pending conn) "")
@@ -302,7 +302,7 @@ connection is not opened; call `ham-connection-open'."
   (ham--connection-set-state conn 'disconnected "closed"))
 
 (defun ham-connection-send (conn string)
-  "Send STRING over CONN.  Return non-nil on success.
+  "Send STRING over CONN.  Returns non-nil on success.
 A newline is appended if STRING does not already end with one."
   (when (ham-connection-live-p conn)
     (let ((payload (if (string-suffix-p "\n" string) string (concat string "\n"))))
@@ -372,9 +372,7 @@ PRECISION is the number of characters: 4, 6 (default) or 8."
 
 (defun ham-great-circle (lat1 lon1 lat2 lon2)
   "Return (DISTANCE-KM . BEARING-DEGREES) from point 1 to point 2.
-Point 1 is LAT1 and LON1, point 2 is LAT2 and LON2, all in decimal
-degrees.  BEARING is the initial short path bearing, 0 to 360 degrees
-true."
+BEARING is the initial short path bearing, 0 to 360 degrees true."
   (let* ((p1 (degrees-to-radians lat1))
          (p2 (degrees-to-radians lat2))
          (dp (degrees-to-radians (- lat2 lat1)))
@@ -389,8 +387,7 @@ true."
           (mod (+ 360.0 (radians-to-degrees (atan y x))) 360.0))))
 
 (defun ham-grid-distance (grid1 grid2)
-  "Return (DISTANCE-KM . BEARING-DEGREES) from GRID1 to GRID2.
-Both are Maidenhead locators."
+  "Return (DISTANCE-KM . BEARING-DEGREES) between two Maidenhead locators."
   (let ((a (ham-maidenhead-to-latlon grid1))
         (b (ham-maidenhead-to-latlon grid2)))
     (ham-great-circle (car a) (cdr a) (car b) (cdr b))))

@@ -91,6 +91,7 @@
 (require 'ham)
 (require 'cl-lib)
 (require 'subr-x)
+(require 'text-property-search)
 
 (defgroup ham-rig nil
   "Transceiver control through Hamlib rigctld."
@@ -163,6 +164,41 @@ timeout timer, which you should also enable."
   :type '(repeat string)
   :group 'ham-rig)
 
+(defcustom ham-rig-tuning-steps
+  '(1 10 50 100 500 1000 2500 5000 10000 100000 1000000)
+  "Tuning steps in Hz, smallest first, cycled through with left and right."
+  :type '(repeat integer)
+  :group 'ham-rig)
+
+(defcustom ham-rig-default-tuning-step 1000
+  "Tuning step in Hz selected at startup.
+Rounded to the nearest entry of `ham-rig-tuning-steps'."
+  :type 'integer
+  :group 'ham-rig)
+
+(defcustom ham-rig-controls-buffer-name "*ham-rig-controls*"
+  "Name of the buffer listing the levels and functions the rig reports."
+  :type 'string
+  :group 'ham-rig)
+
+(defcustom ham-rig-controls-poll-batch 4
+  "How many controls to refresh on each slow poll.
+Controls are refreshed round robin rather than all at once: a rig can
+report forty writable controls, and a serial link cannot carry forty
+extra requests a second on top of the frequency and meter polls."
+  :type 'integer
+  :group 'ham-rig)
+
+(defcustom ham-rig-controls-exclude nil
+  "Names of levels and functions to leave out of the controls panel."
+  :type '(repeat string)
+  :group 'ham-rig)
+
+(defcustom ham-rig-controls-meter-width 12
+  "Width in characters of the bar beside each level."
+  :type 'integer
+  :group 'ham-rig)
+
 
 ;;;; Faces
 
@@ -224,6 +260,16 @@ timeout timer, which you should also enable."
 (defvar ham-rig--fast-timer nil)
 (defvar ham-rig--slow-timer nil)
 (defvar ham-rig--redisplay-timer nil)
+(defvar ham-rig--step-index nil
+  "Index into `ham-rig-tuning-steps', or nil until first needed.")
+(defvar ham-rig--levels (make-hash-table :test #'equal)
+  "Cached level values, keyed by Hamlib level name.")
+(defvar ham-rig--funcs (make-hash-table :test #'equal)
+  "Cached function states, keyed by Hamlib function name.")
+(defvar ham-rig--controls-dirty nil)
+(defvar ham-rig--controls-cursor 0)
+(defvar ham-rig--controls-last-render nil)
+(defvar ham-rig--controls-redisplay-timer nil)
 (defvar ham-rig--tx-timer nil)
 (defvar ham-rig--tx-started-at nil)
 (defvar ham-rig--unkey-on-reconnect nil)
@@ -439,6 +485,7 @@ station software could be using."
   (and (ham-connection-live-p ham-rig--connection)
        (or ham-rig-poll-when-hidden
            (ham-rig--panel-visible-p)
+           (ham-rig--controls-visible-p)
            (ham-rig-ptt-p)
            (ham-has-subscribers-p ham-rig-topic-frequency)
            (ham-has-subscribers-p ham-rig-topic-ptt))))
@@ -484,7 +531,8 @@ station software could be using."
        'poll)
       (ham-rig--enqueue
        "l ALC" (lambda (r) (ham-rig--set 'alc (ham-rig--num r "ALC")))
-       'poll))))
+       'poll)))
+  (ham-rig--poll-controls))
 
 (defun ham-rig--start-timers ()
   "Start the fast and slow poll timers."
@@ -555,6 +603,11 @@ transmit."
   (pcase state
     ('connected
      (setq ham-rig--inflight nil ham-rig--queue nil ham-rig--resp-lines nil)
+     ;; Anything cached from a previous session describes a rig that may
+     ;; no longer be the one on the other end of the port.
+     (clrhash ham-rig--levels)
+     (clrhash ham-rig--funcs)
+     (setq ham-rig--controls-dirty t ham-rig--controls-last-render nil)
      (when (or ham-rig--unkey-on-reconnect (ham-rig-ptt-p))
        (setq ham-rig--unkey-on-reconnect nil)
        (ham-rig--enqueue "T 0"))
@@ -599,7 +652,11 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
    "\\dump_caps"
    (lambda (r)
      (setq ham-rig--caps (ham-rig-response-alist r))
-     (setq ham-rig--dirty t)
+     (setq ham-rig--dirty t ham-rig--controls-dirty t)
+     ;; The controls panel cannot know what to show until the rig has
+     ;; described itself, so fill it as soon as it has.
+     (when (and (ham-rig--controls-visible-p) (ham-rig-connected-p))
+       (ham-rig-controls-refresh))
      (ham-log "ham-rig: model %s" (or (ham-rig--val r "Model name") "unknown")))))
 
 ;;;###autoload
@@ -640,6 +697,101 @@ Interactively, prompt.  Accepts 14074, 14.074 or 14.074.000."
   (ham-rig--enqueue "f" (lambda (r)
                           (when-let ((f (ham-rig--num r "Frequency")))
                             (ham-rig--set 'frequency (round f))))))
+
+(defun ham-rig--enqueue-latest (match command &optional callback)
+  "Queue COMMAND, first dropping any queued request that MATCH supersedes.
+
+A queued request is superseded when its command is MATCH exactly, or
+begins with MATCH followed by a space.  Requiring that space matters:
+plain prefix matching would let \"l RFPOWER\" also discard a queued
+\"l RFPOWER_METER\", which is a different reading entirely.
+
+Adjusting a control generates a request per keypress and only the last
+one matters.  A held-down key would otherwise pile up hundreds of sets
+that the link has to work through long after the operator stopped."
+  (let ((space (concat match " ")))
+    (setq ham-rig--queue
+          (cl-remove-if (lambda (request)
+                          (let ((queued (ham-rig--request-command request)))
+                            (or (equal queued match)
+                                (string-prefix-p space queued))))
+                        ham-rig--queue)))
+  (ham-rig--enqueue command callback))
+
+(defun ham-rig-tuning-step ()
+  "Return the current tuning step in Hz."
+  (unless ham-rig--step-index
+    (setq ham-rig--step-index
+          (or (cl-position ham-rig-default-tuning-step ham-rig-tuning-steps)
+              (1- (length ham-rig-tuning-steps)))))
+  (setq ham-rig--step-index
+        (max 0 (min ham-rig--step-index (1- (length ham-rig-tuning-steps)))))
+  (nth ham-rig--step-index ham-rig-tuning-steps))
+
+(defun ham-rig-set-tuning-step (hz)
+  "Set the tuning step to HZ, which must be in `ham-rig-tuning-steps'."
+  (interactive
+   (list (string-to-number
+          (completing-read "Step (Hz): "
+                           (mapcar #'number-to-string ham-rig-tuning-steps)
+                           nil t))))
+  (let ((index (cl-position hz ham-rig-tuning-steps)))
+    (unless index (user-error "No such tuning step: %s" hz))
+    (setq ham-rig--step-index index))
+  (setq ham-rig--dirty t)
+  (ham-rig--schedule-redisplay)
+  (message "ham-rig: step %s Hz" (ham-rig-tuning-step)))
+
+(defun ham-rig-step-larger ()
+  "Select the next larger tuning step."
+  (interactive)
+  (ham-rig-tuning-step)
+  (ham-rig-set-tuning-step
+   (nth (min (1+ ham-rig--step-index) (1- (length ham-rig-tuning-steps)))
+        ham-rig-tuning-steps)))
+
+(defun ham-rig-step-smaller ()
+  "Select the next smaller tuning step."
+  (interactive)
+  (ham-rig-tuning-step)
+  (ham-rig-set-tuning-step
+   (nth (max (1- ham-rig--step-index) 0) ham-rig-tuning-steps)))
+
+(defun ham-rig-tune (multiplier)
+  "Move the frequency by MULTIPLIER times the tuning step.
+
+The displayed frequency moves at once rather than waiting for the next
+poll, so that holding an arrow key feels like turning a knob.  The poll
+that follows replaces it with whatever the rig actually settled on,
+which is what corrects for a rig that quantises to its own step."
+  (let ((current (ham-rig-frequency)))
+    (unless current
+      (user-error "Frequency unknown: not connected, or nothing read yet"))
+    (unless (ham-rig-connected-p)
+      (user-error "Not connected to rigctld"))
+    (let ((target (max 0 (+ current (* multiplier (ham-rig-tuning-step))))))
+      (ham-rig--set 'frequency target)
+      (ham-rig--enqueue-latest "F" (format "F %d" target)))))
+
+(defun ham-rig-tune-up ()
+  "Move up one tuning step."
+  (interactive)
+  (ham-rig-tune 1))
+
+(defun ham-rig-tune-down ()
+  "Move down one tuning step."
+  (interactive)
+  (ham-rig-tune -1))
+
+(defun ham-rig-tune-up-fast ()
+  "Move up by ten times the tuning step."
+  (interactive)
+  (ham-rig-tune 10))
+
+(defun ham-rig-tune-down-fast ()
+  "Move down by ten times the tuning step."
+  (interactive)
+  (ham-rig-tune -10))
 
 (defun ham-rig-set-mode (mode &optional passband)
   "Set the transceiver to MODE with optional PASSBAND in Hz."
@@ -785,6 +937,11 @@ leaves the toggle stuck on one VFO from the second press onwards."
      (propertize (if freq (ham-format-frequency freq) "---.---.---")
                  'face 'ham-rig-frequency)
      "   " (propertize (or band "") 'face 'ham-rig-label)
+     (propertize "   STEP " 'face 'ham-rig-label)
+     (let ((step (ham-rig-tuning-step)))
+       (if (>= step 1000)
+           (format "%g k" (/ step 1000.0))
+         (format "%d " step)))
      "\n\n  "
      (propertize "VFO " 'face 'ham-rig-label)
      (format "%-6s" (or (ham-rig-get 'vfo) "--"))
@@ -820,7 +977,10 @@ leaves the toggle stuck on one VFO from the second press onwards."
                "  "
                (format "%-6s" (ham-rig--s-label db))))
      "\n\n  "
-     (propertize "f freq  m mode  b band  v vfo  s split  t ptt  T unkey  g refresh  ? caps"
+     (propertize "up/dn tune  M-up/dn x10  l/r step  f freq  m mode  b band"
+                 'face 'ham-rig-label)
+     "\n  "
+     (propertize "v vfo  s split  t ptt  T unkey  C controls  g refresh  ? caps"
                  'face 'ham-rig-label)
      "\n")))
 
@@ -847,10 +1007,434 @@ leaves the toggle stuck on one VFO from the second press onwards."
           (run-with-idle-timer 0.05 nil #'ham-rig--redisplay))))
 
 
+;;;; Controls discovered from the rig
+
+;; Everything below is driven by what \dump_caps reports, so there is no
+;; list of controls anywhere in this file.  Hamlib describes each level
+;; as NAME(MIN..MAX/STEP), which is all a generic control needs, and
+;; names the ones that can be written in a separate "Set level" line.  A
+;; rig that offers a notch gets a notch; one that does not, does not.
+
+(defconst ham-rig--level-regexp
+  "\\([A-Z0-9_]+\\)(\\(-?[0-9]*\\.?[0-9]+\\)\\.\\.\\(-?[0-9]*\\.?[0-9]+\\)\
+/\\(-?[0-9]*\\.?[0-9]+\\))"
+  "Matches one Hamlib level description, as NAME(MIN..MAX/STEP).")
+
+(cl-defstruct (ham-rig--control (:constructor ham-rig--control-create)
+                                (:copier nil))
+  kind name min max step)
+
+(defun ham-rig--caps-value (&rest keys)
+  "Return the capability string for the first of KEYS reported by the rig."
+  (cl-loop for key in keys
+           thereis (cdr (cl-assoc key ham-rig--caps :test #'cl-equalp))))
+
+(defun ham-rig--parse-levels (string)
+  "Return a list of `ham-rig--control' for the levels described in STRING."
+  (let ((start 0) controls)
+    (while (and string (string-match ham-rig--level-regexp string start))
+      (push (ham-rig--control-create
+             :kind 'level
+             :name (match-string 1 string)
+             :min (string-to-number (match-string 2 string))
+             :max (string-to-number (match-string 3 string))
+             :step (string-to-number (match-string 4 string)))
+            controls)
+      (setq start (match-end 0)))
+    (nreverse controls)))
+
+(defun ham-rig--parse-functions (string)
+  "Return a list of `ham-rig--control' for the functions named in STRING."
+  (mapcar (lambda (name)
+            (ham-rig--control-create :kind 'func :name name))
+          (and string (split-string string "[ \t]+" t))))
+
+(defun ham-rig--control-list ()
+  "Return every control this rig accepts, levels first then functions.
+
+Only writable controls are offered.  Hamlib reports the meters -- signal
+strength, SWR, ALC and the rest -- under \"Get level\" but not under
+\"Set level\", which is exactly the distinction needed to keep read-only
+readings out of a panel whose purpose is changing things."
+  (let ((levels (ham-rig--parse-levels (ham-rig--caps-value "Set level")))
+        (funcs (ham-rig--parse-functions
+                (ham-rig--caps-value "Set functions" "Set func"))))
+    (cl-remove-if (lambda (control)
+                    (or (member (ham-rig--control-name control)
+                                ham-rig-controls-exclude)
+                        (ham-rig--control-degenerate-p control)))
+                  (append levels funcs))))
+
+(defun ham-rig--control-degenerate-p (control)
+  "Return non-nil if CONTROL has no usable range and cannot be offered.
+
+Hamlib writes a level it knows of but cannot describe as 0..0/0.  The
+FTDX10 reports AGC that way: the rig certainly has one, but it takes
+named settings rather than a number, so there is nothing here to slide.
+Offering a control that can only ever be set to zero is worse than
+leaving it out.  A single-valued range like ATT's 12..12 is different
+and is kept."
+  (and (eq (ham-rig--control-kind control) 'level)
+       (= (ham-rig--control-min control) (ham-rig--control-max control))
+       (zerop (ham-rig--control-max control))))
+
+(defun ham-rig--control-usable-step (control)
+  "Return a step for CONTROL that is safe to adjust by.
+Hamlib reports a step of zero for some levels, which cannot be used as
+an increment."
+  (let ((step (ham-rig--control-step control))
+        (span (- (or (ham-rig--control-max control) 0)
+                 (or (ham-rig--control-min control) 0))))
+    (cond
+     ((and step (> step 0)) step)
+     ((>= span 100) 1)
+     ((> span 0) (/ span 100.0))
+     (t 1))))
+
+(defun ham-rig--whole-number-p (n)
+  "Return non-nil if N has no fractional part.
+`truncate' rather than `ftruncate', because Hamlib's ranges parse to
+integers as often as to floats and `ftruncate' rejects integers."
+  (and (numberp n) (= n (truncate n))))
+
+(defun ham-rig--control-integral-p (control)
+  "Return non-nil if CONTROL takes whole numbers only."
+  (and (ham-rig--whole-number-p (ham-rig--control-usable-step control))
+       (ham-rig--whole-number-p (ham-rig--control-min control))
+       (ham-rig--whole-number-p (ham-rig--control-max control))))
+
+(defun ham-rig--control-decimals (control)
+  "Return how many decimal places CONTROL's value is worth showing."
+  (if (ham-rig--control-integral-p control)
+      0
+    (min 3 (max 1 (ceiling (- (log (ham-rig--control-usable-step control) 10)))))))
+
+(defun ham-rig--format-level (control value)
+  "Return VALUE formatted for CONTROL."
+  (cond
+   ((null value) "--")
+   ((ham-rig--control-integral-p control) (format "%d" (round value)))
+   ;; Emacs `format' has no "%.*f": the precision has to be baked in.
+   (t (format (format "%%.%df" (ham-rig--control-decimals control)) value))))
+
+(defun ham-rig--control-value (control)
+  "Return the cached value of CONTROL, or nil."
+  (if (eq (ham-rig--control-kind control) 'func)
+      (gethash (ham-rig--control-name control) ham-rig--funcs 'unknown)
+    (gethash (ham-rig--control-name control) ham-rig--levels)))
+
+(defun ham-rig--set-control-value (control value)
+  "Cache VALUE for CONTROL, marking the panel dirty only if it changed."
+  (let* ((func (eq (ham-rig--control-kind control) 'func))
+         (table (if func ham-rig--funcs ham-rig--levels))
+         (name (ham-rig--control-name control))
+         (old (gethash name table 'none)))
+    (unless (equal old value)
+      (puthash name value table)
+      (setq ham-rig--controls-dirty t)
+      (ham-rig--schedule-controls-redisplay))))
+
+(defun ham-rig--read-control (control &optional kind coalesce)
+  "Queue a read of CONTROL.  KIND is passed to `ham-rig--enqueue'.
+With COALESCE, supersede any read of the same control already queued."
+  (let* ((name (ham-rig--control-name control))
+         (func (eq (ham-rig--control-kind control) 'func))
+         (command (format (if func "u %s" "l %s") name))
+         (callback
+          (if func
+              (lambda (r)
+                (let ((v (ham-rig--val r "Func" name)))
+                  (ham-rig--set-control-value
+                   control (cond ((null v) 'unknown)
+                                 ((equal v "0") nil)
+                                 (t t)))))
+            (lambda (r)
+              (ham-rig--set-control-value control (ham-rig--num r name))))))
+    (if coalesce
+        (ham-rig--enqueue-latest command command callback)
+      (ham-rig--enqueue command callback kind))))
+
+(defun ham-rig--write-control (control value)
+  "Send VALUE for CONTROL, then read it back to see what the rig did."
+  (unless (ham-rig-connected-p)
+    (user-error "Not connected to rigctld"))
+  (let ((name (ham-rig--control-name control)))
+    (if (eq (ham-rig--control-kind control) 'func)
+        (progn
+          (ham-rig--set-control-value control (and value t))
+          (ham-rig--enqueue-latest (format "U %s" name)
+                                   (format "U %s %d" name (if value 1 0))))
+      (let ((clamped (max (ham-rig--control-min control)
+                          (min (ham-rig--control-max control) value))))
+        (ham-rig--set-control-value control clamped)
+        (ham-rig--enqueue-latest
+         (format "L %s" name)
+         (format "L %s %s" name
+                 (if (ham-rig--control-integral-p control)
+                     (format "%d" (round clamped))
+                   (format "%f" clamped))))))
+    ;; Read back what the rig actually accepted, coalesced so that
+    ;; holding a key does not queue a confirmation per repeat.
+    (ham-rig--read-control control nil t)))
+
+
+;;;; Controls polling
+
+(defun ham-rig--controls-visible-p ()
+  "Return non-nil if the controls panel is displayed on some frame."
+  (let ((buf (get-buffer ham-rig-controls-buffer-name)))
+    (and buf (get-buffer-window buf t) t)))
+
+(defun ham-rig--poll-controls ()
+  "Refresh a few controls, round robin.
+
+A rig can report forty writable controls.  Asking for all of them on
+every slow tick would swamp a serial link that is also carrying the
+frequency and meter polls, so each tick takes the next few and the panel
+converges over a second or two."
+  (when (and (ham-rig--controls-visible-p)
+             (ham-rig-connected-p))
+    (let* ((controls (ham-rig--control-list))
+           (total (length controls)))
+      (when (> total 0)
+        (dotimes (_ (min ham-rig-controls-poll-batch total))
+          (let ((control (nth (mod ham-rig--controls-cursor total) controls)))
+            (cl-incf ham-rig--controls-cursor)
+            (ham-rig--read-control control 'poll)))))))
+
+(defun ham-rig-controls-refresh ()
+  "Read every control from the rig now.
+
+Requests go in as user requests rather than polls so that none are
+dropped for backpressure: the round robin would take the better part of
+ten seconds to fill a panel of forty controls, which is too long to
+stare at a screen of dashes."
+  (interactive)
+  (unless (ham-rig-connected-p)
+    (user-error "Not connected to rigctld"))
+  (dolist (control (ham-rig--control-list))
+    (ham-rig--read-control control))
+  (setq ham-rig--controls-dirty t
+        ham-rig--controls-last-render nil)
+  (ham-rig--schedule-controls-redisplay))
+
+
+;;;; Controls rendering
+
+(defun ham-rig--control-at-point ()
+  "Return the control described on the current line, or nil."
+  (get-text-property (line-beginning-position) 'ham-rig-control))
+
+(defun ham-rig--render-control (control)
+  "Return the panel line for CONTROL."
+  (let* ((name (ham-rig--control-name control))
+         (value (ham-rig--control-value control))
+         (line
+          (if (eq (ham-rig--control-kind control) 'func)
+              (concat
+               (format "    %-18s " name)
+               (pcase value
+                 ('unknown (propertize "--" 'face 'ham-rig-label))
+                 ('nil (propertize "off" 'face 'ham-rig-label))
+                 (_ (propertize "on" 'face 'ham-rig-rx))))
+            (let* ((min (ham-rig--control-min control))
+                   (max (ham-rig--control-max control))
+                   (span (- max min))
+                   (fraction (and value (> span 0) (/ (- value min) (float span)))))
+              (concat
+               (format "    %-18s " name)
+               (ham-rig--bar fraction ham-rig-controls-meter-width)
+               " "
+               (format "%-8s" (ham-rig--format-level control value))
+               (propertize (format "%s..%s"
+                                   (ham-rig--format-level control min)
+                                   (ham-rig--format-level control max))
+                           'face 'ham-rig-label))))))
+    (propertize (concat line "\n") 'ham-rig-control control)))
+
+(defun ham-rig--render-controls ()
+  "Return the controls panel contents as a string."
+  (let ((controls (ham-rig--control-list))
+        (model (ham-rig--caps-value "Model name")))
+    (if (null controls)
+        (concat "\n  "
+                (if (ham-rig-connected-p)
+                    "Waiting for the rig to report its capabilities..."
+                  "Not connected. M-x ham-rig-connect")
+                "\n")
+      (concat
+       "\n  "
+       (propertize (or model "rig") 'face 'ham-rig-label)
+       (propertize "   controls" 'face 'ham-rig-label)
+       "\n"
+       (let ((levels (cl-remove-if-not
+                      (lambda (c) (eq (ham-rig--control-kind c) 'level))
+                      controls))
+             (funcs (cl-remove-if-not
+                     (lambda (c) (eq (ham-rig--control-kind c) 'func))
+                     controls)))
+         (concat
+          (if levels
+              (concat "\n  " (propertize "LEVELS" 'face 'ham-rig-label) "\n"
+                      (mapconcat #'ham-rig--render-control levels ""))
+            "")
+          (if funcs
+              (concat "\n  " (propertize "FUNCTIONS" 'face 'ham-rig-label) "\n"
+                      (mapconcat #'ham-rig--render-control funcs ""))
+            "")))
+       "\n  "
+       (propertize "l/r adjust  L/R x10  RET toggle or set  = value  g refresh  q quit"
+                   'face 'ham-rig-label)
+       "\n"))))
+
+(defun ham-rig--controls-redisplay ()
+  "Repaint the controls panel if it is visible and something changed."
+  (setq ham-rig--controls-redisplay-timer nil)
+  (when (and ham-rig--controls-dirty (ham-rig--controls-visible-p))
+    (setq ham-rig--controls-dirty nil)
+    (let ((text (ham-rig--render-controls)))
+      (unless (equal text ham-rig--controls-last-render)
+        (setq ham-rig--controls-last-render text)
+        (with-current-buffer (get-buffer-create ham-rig-controls-buffer-name)
+          (let* ((inhibit-read-only t)
+                 (previous (ham-rig--control-at-point))
+                 (column (current-column)))
+            (erase-buffer)
+            (insert text)
+            (goto-char (point-min))
+            ;; Return to the control the cursor was on rather than to a
+            ;; line number, so a panel that gains a row underneath does
+            ;; not move the selection out from under the operator.
+            (when previous
+              (let ((target (text-property-search-forward
+                             'ham-rig-control previous
+                             (lambda (want have)
+                               (and have (equal (ham-rig--control-name want)
+                                                (ham-rig--control-name have)))))))
+                (if target
+                    (goto-char (prop-match-beginning target))
+                  (goto-char (point-min)))))
+            (move-to-column column)))))))
+
+(defun ham-rig--schedule-controls-redisplay ()
+  "Coalesce controls repaints onto an idle timer."
+  (unless ham-rig--controls-redisplay-timer
+    (setq ham-rig--controls-redisplay-timer
+          (run-with-idle-timer 0.05 nil #'ham-rig--controls-redisplay))))
+
+
+;;;; Controls commands
+
+(defun ham-rig--adjust-control-at-point (multiplier)
+  "Adjust the control on the current line by MULTIPLIER times its step."
+  (let ((control (ham-rig--control-at-point)))
+    (unless control (user-error "No control on this line"))
+    (if (eq (ham-rig--control-kind control) 'func)
+        (ham-rig--write-control control (not (eq (ham-rig--control-value control) t)))
+      (let ((value (ham-rig--control-value control)))
+        (unless value
+          (user-error "%s has not been read from the rig yet"
+                      (ham-rig--control-name control)))
+        (ham-rig--write-control
+         control
+         (+ value (* multiplier (ham-rig--control-usable-step control))))))))
+
+(defun ham-rig-control-increase ()
+  "Increase the control on the current line, or toggle it if it is a switch."
+  (interactive)
+  (ham-rig--adjust-control-at-point 1))
+
+(defun ham-rig-control-decrease ()
+  "Decrease the control on the current line, or toggle it if it is a switch."
+  (interactive)
+  (ham-rig--adjust-control-at-point -1))
+
+(defun ham-rig-control-increase-fast ()
+  "Increase the control on the current line by ten times its step."
+  (interactive)
+  (ham-rig--adjust-control-at-point 10))
+
+(defun ham-rig-control-decrease-fast ()
+  "Decrease the control on the current line by ten times its step."
+  (interactive)
+  (ham-rig--adjust-control-at-point -10))
+
+(defun ham-rig-control-set ()
+  "Prompt for a value for the control on the current line."
+  (interactive)
+  (let ((control (ham-rig--control-at-point)))
+    (unless control (user-error "No control on this line"))
+    (if (eq (ham-rig--control-kind control) 'func)
+        (ham-rig--write-control
+         control (y-or-n-p (format "Turn %s on? " (ham-rig--control-name control))))
+      (let* ((min (ham-rig--control-min control))
+             (max (ham-rig--control-max control))
+             (value (read-number
+                     (format "%s (%s..%s): "
+                             (ham-rig--control-name control)
+                             (ham-rig--format-level control min)
+                             (ham-rig--format-level control max))
+                     (ham-rig--control-value control))))
+        (ham-rig--write-control control value)))))
+
+(defun ham-rig-control-toggle ()
+  "Toggle a function, or prompt for a level, on the current line."
+  (interactive)
+  (let ((control (ham-rig--control-at-point)))
+    (unless control (user-error "No control on this line"))
+    (if (eq (ham-rig--control-kind control) 'func)
+        (ham-rig--write-control control (not (eq (ham-rig--control-value control) t)))
+      (ham-rig-control-set))))
+
+(defvar-keymap ham-rig-controls-mode-map
+  :doc "Keymap for `ham-rig-controls-mode'."
+  "<right>" #'ham-rig-control-increase
+  "<left>" #'ham-rig-control-decrease
+  "M-<right>" #'ham-rig-control-increase-fast
+  "M-<left>" #'ham-rig-control-decrease-fast
+  "+" #'ham-rig-control-increase
+  "-" #'ham-rig-control-decrease
+  "RET" #'ham-rig-control-toggle
+  "SPC" #'ham-rig-control-toggle
+  "=" #'ham-rig-control-set
+  "g" #'ham-rig-controls-refresh
+  "L" #'ham-show-log)
+
+(define-derived-mode ham-rig-controls-mode special-mode "Rig Controls"
+  "Major mode for the rig's levels and functions."
+  (setq-local truncate-lines t))
+
+;;;###autoload
+(defun ham-rig-controls ()
+  "Open the panel of levels and functions the rig reports.
+
+The list comes from the rig itself, so it shows what this radio can do
+and nothing it cannot."
+  (interactive)
+  (let ((buf (get-buffer-create ham-rig-controls-buffer-name)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'ham-rig-controls-mode) (ham-rig-controls-mode)))
+    (pop-to-buffer buf)
+    (unless (ham-rig-connected-p) (ham-rig-connect))
+    (setq ham-rig--controls-dirty t ham-rig--controls-last-render nil)
+    (when (and (ham-rig-connected-p) ham-rig--caps)
+      (ham-rig-controls-refresh))
+    (ham-rig--controls-redisplay)))
+
+
 ;;;; Major mode
 
 (defvar-keymap ham-rig-mode-map
   :doc "Keymap for `ham-rig-mode'."
+  "<up>" #'ham-rig-tune-up
+  "<down>" #'ham-rig-tune-down
+  "M-<up>" #'ham-rig-tune-up-fast
+  "M-<down>" #'ham-rig-tune-down-fast
+  "<right>" #'ham-rig-step-larger
+  "<left>" #'ham-rig-step-smaller
+  "<prior>" #'ham-rig-tune-up-fast
+  "<next>" #'ham-rig-tune-down-fast
+  "." #'ham-rig-set-tuning-step
   "f" #'ham-rig-set-frequency
   "m" #'ham-rig-set-mode
   "b" #'ham-rig-set-band
@@ -862,6 +1446,7 @@ leaves the toggle stuck on one VFO from the second press onwards."
   "c" #'ham-rig-connect
   "d" #'ham-rig-disconnect
   "?" #'ham-rig-show-capabilities
+  "C" #'ham-rig-controls
   "S" #'ham-rig-show-stats
   "L" #'ham-show-log)
 
