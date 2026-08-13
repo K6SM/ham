@@ -6,7 +6,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
-;; URL: https://github.com/K6SM/ham.el
+;; URL: https://github.com/K6SM/ham
 
 ;; This file is not part of GNU Emacs.
 
@@ -228,6 +228,24 @@ that the terminal path is a designed fallback and not an afterthought."
       (setq start (1+ idx)))
     (setf (ham-connection-pending conn) (substring text start))))
 
+(defun ham--connection-socket-busy-p (conn)
+  "Return non-nil if CONN's process is open or still connecting.
+
+This asks the process rather than the connection state, because
+scheduling a reconnect moves the state to `reconnecting' and so would
+make a perfectly good socket look idle to `ham-connection-live-p'."
+  (let ((process (ham-connection-process conn)))
+    (and process
+         (process-live-p process)
+         (memq (process-status process) '(open connect))
+         t)))
+
+(defun ham--connection-cancel-reconnect (conn)
+  "Cancel any reconnection pending for CONN."
+  (when (ham-connection-reconnect-timer conn)
+    (cancel-timer (ham-connection-reconnect-timer conn))
+    (setf (ham-connection-reconnect-timer conn) nil)))
+
 (defun ham--connection-schedule-reconnect (conn)
   "Arrange for CONN to be retried after its current backoff delay."
   (when (and (ham-connection-auto-reconnect conn)
@@ -241,13 +259,24 @@ that the terminal path is a designed fallback and not an afterthought."
             (run-at-time delay nil
                          (lambda ()
                            (setf (ham-connection-reconnect-timer conn) nil)
-                           (ham-connection-open conn)))))))
+                           ;; Never reopen a connection whose socket has come
+                           ;; back in the meantime: doing so deletes a working
+                           ;; process, which schedules another reconnect, and
+                           ;; the connection then flaps forever at the backoff
+                           ;; interval.
+                           (if (ham--connection-socket-busy-p conn)
+                               (when (eq (process-status
+                                          (ham-connection-process conn))
+                                         'open)
+                                 (ham--connection-set-state conn 'connected))
+                             (ham-connection-open conn))))))))
 
 (defun ham--connection-sentinel (conn event)
   "Handle a process EVENT for CONN."
   (cond
    ((string-prefix-p "open" event)
     (setf (ham-connection-backoff conn) ham-reconnect-initial-delay)
+    (ham--connection-cancel-reconnect conn)
     (ham--connection-set-state conn 'connected))
    ((string-match-p "\\`\\(failed\\|connection broken\\)" event)
     (ham--connection-set-state conn 'disconnected (string-trim event))
@@ -268,10 +297,22 @@ connection is not opened; call `ham-connection-open'."
                           :auto-reconnect auto-reconnect
                           :backoff ham-reconnect-initial-delay))
 
+(defun ham--connection-discard-process (conn)
+  "Delete CONN's process, if any, without treating that as a link failure.
+
+The process slot is cleared before the delete so that the resulting
+sentinel event is recognised as belonging to a process we have already
+abandoned.  Left in place, our own teardown arrives looking exactly like
+the remote end hanging up, and the connection schedules a reconnect it
+does not need."
+  (let ((process (ham-connection-process conn)))
+    (when process
+      (setf (ham-connection-process conn) nil)
+      (ignore-errors (delete-process process)))))
+
 (defun ham-connection-open (conn)
-  "Open CONN asynchronously.  Returns CONN."
-  (when (ham-connection-process conn)
-    (ignore-errors (delete-process (ham-connection-process conn))))
+  "Open CONN asynchronously.  Return CONN."
+  (ham--connection-discard-process conn)
   (setf (ham-connection-pending conn) "")
   (ham--connection-set-state conn 'connecting)
   (condition-case err
@@ -283,8 +324,20 @@ connection is not opened; call `ham-connection-open'."
              :nowait t
              :noquery t
              :coding 'utf-8-unix
-             :filter (lambda (_proc chunk) (ham--connection-filter conn chunk))
-             :sentinel (lambda (_proc event) (ham--connection-sentinel conn event))))
+             ;; Both handlers ignore anything from a process that is no
+             ;; longer this connection's.  A superseded socket goes on
+             ;; delivering events after its replacement is up, and acting
+             ;; on those tears down the working link -- which schedules a
+             ;; reconnect, which replaces the working process, which
+             ;; delivers another stale event.  That loop runs forever at
+             ;; the reconnect interval and never backs off, because every
+             ;; successful open resets the backoff.
+             :filter (lambda (process chunk)
+                       (when (eq process (ham-connection-process conn))
+                         (ham--connection-filter conn chunk)))
+             :sentinel (lambda (process event)
+                         (when (eq process (ham-connection-process conn))
+                           (ham--connection-sentinel conn event)))))
     (error
      (ham--connection-set-state conn 'disconnected (error-message-string err))
      (ham--connection-schedule-reconnect conn)))
@@ -293,16 +346,12 @@ connection is not opened; call `ham-connection-open'."
 (defun ham-connection-close (conn)
   "Close CONN and cancel any pending reconnection."
   (setf (ham-connection-auto-reconnect conn) nil)
-  (when (ham-connection-reconnect-timer conn)
-    (cancel-timer (ham-connection-reconnect-timer conn))
-    (setf (ham-connection-reconnect-timer conn) nil))
-  (when (ham-connection-process conn)
-    (ignore-errors (delete-process (ham-connection-process conn)))
-    (setf (ham-connection-process conn) nil))
+  (ham--connection-cancel-reconnect conn)
+  (ham--connection-discard-process conn)
   (ham--connection-set-state conn 'disconnected "closed"))
 
 (defun ham-connection-send (conn string)
-  "Send STRING over CONN.  Returns non-nil on success.
+  "Send STRING over CONN.  Return non-nil on success.
 A newline is appended if STRING does not already end with one."
   (when (ham-connection-live-p conn)
     (let ((payload (if (string-suffix-p "\n" string) string (concat string "\n"))))
@@ -372,7 +421,9 @@ PRECISION is the number of characters: 4, 6 (default) or 8."
 
 (defun ham-great-circle (lat1 lon1 lat2 lon2)
   "Return (DISTANCE-KM . BEARING-DEGREES) from point 1 to point 2.
-BEARING is the initial short path bearing, 0 to 360 degrees true."
+Point 1 is LAT1 and LON1, point 2 is LAT2 and LON2, all in decimal
+degrees.  BEARING is the initial short path bearing, 0 to 360 degrees
+true."
   (let* ((p1 (degrees-to-radians lat1))
          (p2 (degrees-to-radians lat2))
          (dp (degrees-to-radians (- lat2 lat1)))
@@ -387,7 +438,8 @@ BEARING is the initial short path bearing, 0 to 360 degrees true."
           (mod (+ 360.0 (radians-to-degrees (atan y x))) 360.0))))
 
 (defun ham-grid-distance (grid1 grid2)
-  "Return (DISTANCE-KM . BEARING-DEGREES) between two Maidenhead locators."
+  "Return (DISTANCE-KM . BEARING-DEGREES) from GRID1 to GRID2.
+Both are Maidenhead locators."
   (let ((a (ham-maidenhead-to-latlon grid1))
         (b (ham-maidenhead-to-latlon grid2)))
     (ham-great-circle (car a) (cdr a) (car b) (cdr b))))
