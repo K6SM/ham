@@ -19,14 +19,13 @@ Everything works in a terminal.
 | --- | --- |
 | `ham.el` | Event bus, TCP transport, geodesy, band plan. |
 | `ham-rig.el` | Transceiver panel and controls panel. |
-| `test/` | 181 unit tests, 27 end-to-end tests. |
 
 ## Requirements
 
 - Emacs 29.1 or later
 - [Hamlib](https://hamlib.github.io/), for `rigctld`
 
-Developed on Emacs 29.3 and Hamlib 4.5.5, against a Yaesu FTDX10.
+Developed on Emacs 29.3 and Hamlib 4.5.5, tested with a Yaesu FTDX10.
 
 ## Installation
 
@@ -271,34 +270,6 @@ To read state directly: `ham-rig-frequency`, `ham-rig-current-mode`,
 distance and bearing, `ham-band-for-frequency`, `ham-parse-frequency` and
 `ham-format-frequency`.
 
-## Testing
-
-```
-make check     # compile with warnings as errors, checkdoc, both suites
-make test      # 181 unit tests, no radio or rigctld needed
-make live      # 27 end-to-end tests against a real rigctld
-make compile   # compile only
-```
-
-`make live` starts its own `rigctld -m 1 -P RIG` on a free port and skips
-itself if `rigctld` is absent.
-
-`package-lint` is not part of `make check`, since it is MELPA-only and would
-make the target need the network. Run it from a checkout of
-[package-lint](https://github.com/purcell/package-lint); both files are clean.
-
-## Status
-
-Both files compile clean with warnings as errors and pass `checkdoc`,
-`package-lint` and 208 tests.
-
-Frequency, mode, passband, VFO, split, PTT, tuning and the meters are confirmed
-against an FTDX10. The controls panel is built from that radio's reported
-capabilities and tested against them.
-
-VFO mode (`rigctld -o`) is detected and warned about, not supported. Run
-`rigctld` without `-o`.
-
-## Licence
+## License
 
 GPL-3.0-or-later.
