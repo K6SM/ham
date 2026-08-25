@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.12.1
+;; Version: 0.13.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -80,24 +80,29 @@ any single feed."
   :type '(choice (const :tag "Manual only" nil) integer)
   :group 'ham-spacewx)
 
-(defcustom ham-spacewx-series-length 30
+(defcustom ham-spacewx-series-length 28
   "Number of samples to draw in a sparkline.
+
+Chosen so that a sparkline and the words describing it both fit inside
+`ham-spacewx-panel-width'.  Widen them together, or the annotation
+after the trace loses its room and is elided.
+
 `ham-spacewx-metric-views' overrides this for individual metrics."
   :type 'integer
   :group 'ham-spacewx)
 
 (defcustom ham-spacewx-metric-views
-  '((speed    :samples 60 :units 30)
-    (density  :samples 60 :units 30)
-    (bt       :samples 60 :units 30)
-    (bz       :samples 60 :units 30)
-    (xray     :samples 60 :units 30)
-    (kp       :days 5 :units 30)
-    (a-index  :days 5 :units 30)
-    (flux     :days 5 :units 30)
-    (xray-max :days 5 :units 30 :aggregate max)
-    (protons  :days 5 :units 30 :aggregate max)
-    (sunspots :days 30 :units 30))
+  '((speed    :samples 60 :units 28)
+    (density  :samples 60 :units 28)
+    (bt       :samples 60 :units 28)
+    (bz       :samples 60 :units 28)
+    (xray     :samples 60 :units 28)
+    (kp       :days 5 :units 28)
+    (a-index  :days 5 :units 28)
+    (flux     :days 5 :units 28)
+    (xray-max :days 5 :units 28 :aggregate max)
+    (protons  :days 5 :units 28 :aggregate max)
+    (sunspots :days 30 :units 28))
   "How much of each metric to draw, and how wide to draw it.
 
 Each entry is (METRIC . PLIST) accepting:
@@ -1020,17 +1025,19 @@ Above 10 pfu is a NOAA S1 radiation storm, and polar paths close."
 (defun ham-spacewx-kp-description (kp)
   "Return a plain description of planetary K index KP.
 The bands follow the NOAA G scale: below 4 is quiet to unsettled, 5 and
-above is a geomagnetic storm."
+above is a geomagnetic storm.  Storm levels name their G number without
+the word storm, which the G number already says and which does not fit
+the column beside the reading."
   (cond
    ((null kp) "unknown")
    ((< kp 2) "quiet")
    ((< kp 4) "unsettled")
    ((< kp 5) "active")
-   ((< kp 6) "minor storm G1")
-   ((< kp 7) "moderate storm G2")
-   ((< kp 8) "strong storm G3")
-   ((< kp 9) "severe storm G4")
-   (t "extreme storm G5")))
+   ((< kp 6) "minor G1")
+   ((< kp 7) "moderate G2")
+   ((< kp 8) "strong G3")
+   ((< kp 9) "severe G4")
+   (t "extreme G5")))
 
 (defun ham-spacewx-xray-class (flux)
   "Return FLUX in W/m^2 as a flare class string such as \"B4.2\".
@@ -1038,10 +1045,18 @@ Returns nil if FLUX is nil."
   (when (and flux (> flux 0))
     (let* ((bands '((1.0e-4 . "X") (1.0e-5 . "M") (1.0e-6 . "C")
                     (1.0e-7 . "B") (1.0e-8 . "A")))
-           (band (seq-find (lambda (b) (>= flux (car b))) bands)))
-      (if band
-          (format "%s%.1f" (cdr band) (/ flux (car band)))
-        (format "A%.1f" (/ flux 1.0e-8))))))
+           (band (seq-find (lambda (b) (>= flux (car b))) bands))
+           (index (and band (seq-position bands band)))
+           (letter (if band (cdr band) "A"))
+           (mantissa (/ flux (if band (car band) 1.0e-8))))
+      ;; A flux a hair under a threshold rounds up to ten and prints as
+      ;; B10.0, which is not a flare class anyone writes: that is C1.0.
+      ;; X has no band above it and does run past ten, so it is left
+      ;; alone.
+      (when (and index (> index 0) (>= (round (* 10 mantissa)) 100))
+        (setq letter (cdr (nth (1- index) bands))
+              mantissa 1.0))
+      (format "%s%.1f" letter mantissa))))
 
 (defun ham-spacewx-bz-description (bz)
   "Return a plain description of field component BZ.
@@ -1052,7 +1067,7 @@ called out."
    ((> bz 1.0) "northward")
    ((> bz -2.0) "neutral")
    ((> bz -8.0) "southward")
-   (t "strongly southward")))
+   (t "strong southward")))
 
 
 ;;;; Severity
@@ -1565,7 +1580,7 @@ expectations, not to be measured against."
              (minutes (/ seconds 60.0)))
         (cond
          ((< minutes 1) nil)
-         ((< minutes 90) (format "%d min" (round minutes)))
+         ((< minutes 60) (format "%d min" (round minutes)))
          ((< minutes 2880) (format "%d h" (round (/ minutes 60))))
          (t (format "%d d" (round (/ minutes 1440)))))))))
 
@@ -1954,75 +1969,187 @@ a payload this package does not understand."
 
 ;;;; Rendering
 
-(defconst ham-spacewx--label-width 32
+;; The panel is laid out to a fixed narrow width so it can live in a
+;; side window beside the log or the rig panel without wrapping.  Every
+;; column below is derived from that width, and anything that will not
+;; fit is truncated rather than allowed to run past it.
+;;
+;;   col  1  2   indent
+;;        3 20   label
+;;       21 27   number, right aligned so the digits line up
+;;       28      gap
+;;       29 33   unit, left aligned so the units line up
+;;       34      gap
+;;       35 50   note, describing the reading in words
+;;
+;; and beneath it, for a reading with a trend:
+;;
+;;   col  1  4   indent
+;;        5 32   sparkline
+;;       33 34   gap
+;;       35 50   annotation, describing the trace's span and scale
+
+(defcustom ham-spacewx-panel-width 50
+  "Width in columns the panel lays itself out to.
+
+Kept narrow on purpose: the panel is meant to sit in a side window
+beside something else, and a reading that wraps is harder to read than
+one that is merely terse."
+  :type 'integer
+  :group 'ham-spacewx)
+
+(defconst ham-spacewx--label-width 18
   "Column width for reading labels.")
 
-(defconst ham-spacewx--value-width 14
-  "Column width for reading values.")
+(defconst ham-spacewx--number-width 7
+  "Column width for the number itself, which is right aligned.
+Right aligning the digits is what lets a column of readings be scanned
+down rather than read across.")
+
+(defconst ham-spacewx--unit-width 5
+  "Column width for the unit following a number, which is left aligned.")
 
 (defconst ham-spacewx--sparkline-indent 4
   "Indent of the sparkline line beneath its reading.")
+
+(defun ham-spacewx--reading-width ()
+  "Return the column the words after a reading start at."
+  (+ 2 ham-spacewx--label-width ham-spacewx--number-width 1
+     ham-spacewx--unit-width 1))
+
+(defun ham-spacewx--fit (text width)
+  "Return TEXT cut to WIDTH columns, keeping any faces on it.
+A value that will not fit is worse than one that is shortened, because
+a line that runs past the panel's width pushes everything after it out
+of view."
+  (cond
+   ((null text) "")
+   ((<= (string-width text) width) text)
+   ((<= width 1) (substring text 0 (max 0 width)))
+   (t (concat (truncate-string-to-width text (1- width)) "…"))))
+
+(defun ham-spacewx--wrap (text width indent)
+  "Insert TEXT wrapped to WIDTH columns, INDENT spaces in from the left.
+Used for prose the panel cannot shorten, such as the reason a feed
+failed, which is written by the far end rather than by this package."
+  (let ((margin (make-string indent ?\s))
+        (room (max 1 (- width indent)))
+        (line ""))
+    (dolist (word (split-string text " " t))
+      (cond
+       ((string-empty-p line) (setq line word))
+       ((<= (+ (string-width line) 1 (string-width word)) room)
+        (setq line (concat line " " word)))
+       (t (insert margin line "\n")
+          (setq line word))))
+    (unless (string-empty-p line)
+      (insert margin line "\n"))))
 
 (defun ham-spacewx--heading (text)
   "Insert TEXT as a section heading."
   (insert "\n" (propertize text 'face 'ham-spacewx-heading) "\n"))
 
-(defun ham-spacewx--row (label value &optional note metric reading)
+(defun ham-spacewx--row (label number &optional unit note metric reading)
   "Insert one reading, and its trend beneath it.
 
-LABEL names the reading and VALUE is its formatted value.  NOTE is an
-optional plain description shown after it.
+LABEL names the reading.  NUMBER is its formatted value with no unit on
+it, so that the digits of every reading can be aligned on one column
+and the units on another.  UNIT is that unit.  NOTE is an optional
+plain description of what the value means, which sits beside it.
 
 METRIC supplies the series, the window and the colours.  READING is the
-number behind VALUE; the colour comes from it rather than from the
+number behind NUMBER; the colour comes from it rather than from the
 sparkline, because the sparkline may be resampled and the last bucket's
 average is not the current reading.  When READING is omitted the last
 drawn sample stands in.
+
+The trend goes on the line beneath, and what describes the trend -- how
+long it covers, how far the ramp reaches -- goes with it rather than
+with the reading.  Words about the value stay by the value; words about
+the picture stay by the picture.
 
 One colour covers the value, the note and every sample of the trace, so
 a reading and the words describing it never disagree."
   (let* ((drawn (and metric (ham-spacewx-metric-drawn metric)))
          (series (car drawn))
-         (span (ham-spacewx--span-label (cdr drawn)))
-         (scale (ham-spacewx--scale-note series metric))
-         (annotation (string-join (delq nil (list span scale)) ", "))
          (shown (if (and metric (null reading))
                     (ham-spacewx--latest series)
                   reading))
          (face (or (and metric (ham-spacewx--face-for metric shown))
                    'ham-spacewx-value))
-         (name (if (string-empty-p annotation)
-                   label
-                 (format "%s (%s)" label annotation))))
+         (room (- ham-spacewx-panel-width (ham-spacewx--reading-width))))
     (insert "  "
-            (propertize (string-pad name ham-spacewx--label-width)
+            (propertize (ham-spacewx--fit (string-pad label
+                                                      ham-spacewx--label-width)
+                                          ham-spacewx--label-width)
                         'face 'ham-spacewx-label)
-            (propertize (or value "—") 'face face))
+            (propertize (string-pad (or number "—")
+                                    ham-spacewx--number-width nil t)
+                        'face face)
+            " "
+            ;; No number, no unit.  "— pfu" reads as a measurement in
+            ;; particle flux units when what happened is that nothing
+            ;; was measured at all.
+            (propertize (string-pad (if number (or unit "") "")
+                                    ham-spacewx--unit-width)
+                        'face 'ham-spacewx-label))
     (when (and note (not (string-empty-p note)))
-      (insert "  " (propertize note 'face face)))
-    ;; Every reading reports its own age, rather than only the ones
-    ;; whose feed happened to fail.  A number the operator cannot date
-    ;; is worse than no number.
-    (let ((age (and metric (ham-spacewx--metric-age metric))))
-      (when age
-        (insert (propertize (format "  (%s old)"
-                                    (ham-spacewx--duration-label age))
-                            'face 'ham-spacewx-stale))))
+      (insert " " (propertize (ham-spacewx--fit note room) 'face face)))
     (insert "\n")
-    (when series
-      (let ((line (ham-spacewx-sparkline series
-                                         (ham-spacewx-metric-window metric)
-                                         metric)))
-        (unless (string-empty-p line)
+    (ham-spacewx--insert-trend series metric)))
+
+(defun ham-spacewx--insert-trend (series metric)
+  "Insert the sparkline for SERIES under METRIC, and what describes it.
+
+The annotation says how long the trace covers and how far its ramp
+reaches, and -- when the feed behind it has aged out -- how old the
+reading is.  Age displaces the vertical range rather than joining it:
+in the space available, knowing a number is three hours stale matters
+more than knowing what the trace's top and bottom were."
+  (when series
+    (let ((line (ham-spacewx-sparkline series
+                                       (ham-spacewx-metric-window metric)
+                                       metric)))
+      (unless (string-empty-p line)
+        (let* ((drawn (ham-spacewx-metric-drawn metric))
+               (span (ham-spacewx--span-label (cdr drawn)))
+               (age (ham-spacewx--metric-age metric))
+               (detail (if age
+                           (format "%s old" (ham-spacewx--duration-label age))
+                         (ham-spacewx--scale-note series metric)))
+               (annotation (string-join (delq nil (list span detail)) ", "))
+               (room (- ham-spacewx-panel-width
+                        ham-spacewx--sparkline-indent
+                        (string-width line) 2)))
           (insert (make-string ham-spacewx--sparkline-indent ?\s))
           (insert (if (get-text-property 0 'face line)
                       line
                     (propertize line 'face 'ham-spacewx-sparkline)))
+          (unless (or (string-empty-p annotation) (< room 4))
+            (insert "  " (propertize (ham-spacewx--fit annotation room)
+                                     'face (if age
+                                               'ham-spacewx-stale
+                                             'ham-spacewx-label))))
           (insert "\n"))))))
 
 (defun ham-spacewx--number-string (value format-string)
   "Return VALUE rendered with FORMAT-STRING, or nil if VALUE is nil."
   (and value (format format-string value)))
+
+(defun ham-spacewx--compact-number (value)
+  "Return VALUE with enough decimals to be useful and no more.
+
+Proton flux is the case this exists for.  It sits below one for months
+and reaches five figures during a radiation storm, and a fixed two
+decimals that reads well at 0.24 pfu is 48210.75 during the event the
+reading is there to warn about -- wider than its column, at the one
+moment the panel is being read in a hurry."
+  (when value
+    (let ((magnitude (abs value)))
+      (cond
+       ((>= magnitude 100) (format "%.0f" value))
+       ((>= magnitude 10) (format "%.1f" value))
+       (t (format "%.2f" value))))))
 
 
 (defun ham-spacewx--metric-age (metric)
@@ -2054,9 +2181,11 @@ cluttered with ages that all say the same thing."
   (ham-spacewx--heading "Propagation (estimated)")
   (cond
    ((null (ham-station-latlon))
-    (insert (propertize
-             "  Set `ham-station-grid' to your locator for a local estimate.\n"
-             'face 'ham-spacewx-label)))
+    (let ((start (point)))
+      (ham-spacewx--wrap
+       "Set `ham-station-grid' to your locator for a local estimate."
+       ham-spacewx-panel-width 2)
+      (put-text-property start (point) 'face 'ham-spacewx-label)))
    ((null (ham-spacewx-muf))
     (insert (propertize "  Waiting for solar data.\n" 'face 'ham-spacewx-label)))
    (t
@@ -2064,31 +2193,48 @@ cluttered with ages that all say the same thing."
            (luf (ham-spacewx-luf))
            (night (time-add (current-time) (seconds-to-time (* 12 3600))))
            (muf-night (ham-spacewx-muf night)))
-      (ham-spacewx--row
-       "MUF, 3000 km hop"
-       (format "%.1f MHz" muf)
-       (format "now; %.1f MHz in 12 h" muf-night))
-      (ham-spacewx--row "Absorption floor" (format "%.1f MHz" luf))
+      ;; Now and twelve hours out are two readings, not one reading and
+      ;; a parenthesis, so they align in the same column and can be
+      ;; compared by looking straight down.
+      (ham-spacewx--row "MUF, 3000 km hop" (format "%.1f" muf) "MHz")
+      (ham-spacewx--row "MUF in 12 h" (format "%.1f" muf-night) "MHz")
+      (ham-spacewx--row "Absorption floor" (format "%.1f" luf) "MHz")
       ;; Day and night separately.  A single row for "now" hides the
       ;; thing an operator actually plans around: which bands will be
       ;; there this evening, and which will not.
+      ;;
+      ;; The bands go on their own line rather than beside a label: the
+      ;; list is as wide as the panel, and `ham-spacewx-bands' is a
+      ;; setting, so a station that adds bands must still fit.
       (dolist (period (list (cons "Bands by day" ham-spacewx-f2-peak-hour)
                             (cons "Bands at night" 2.0)))
-        (insert "  " (propertize (string-pad (car period)
-                                             ham-spacewx--label-width)
-                                 'face 'ham-spacewx-label))
-        (dolist (entry (ham-spacewx-band-conditions-at (cdr period)))
-          (insert (propertize (car entry) 'face
-                              (ham-spacewx--condition-face (cdr entry)))
-                  " "))
-        (insert "\n"))
-      (insert "  " (string-pad "" ham-spacewx--label-width))
-      (dolist (state '((good . "good") (fair . "fair")
-                       (poor . "marginal") (closed . "closed")))
-        (insert (propertize (cdr state) 'face
-                            (ham-spacewx--condition-face (car state)))
-                " "))
-      (insert "\n")))))
+        (insert "  " (propertize (car period) 'face 'ham-spacewx-label) "\n")
+        (ham-spacewx--insert-legend
+         (mapcar (lambda (entry)
+                   (cons (car entry) (ham-spacewx--condition-face (cdr entry))))
+                 (ham-spacewx-band-conditions-at (cdr period)))))
+      (ham-spacewx--insert-legend
+       (mapcar (lambda (state)
+                 (cons (cdr state) (ham-spacewx--condition-face (car state))))
+               '((good . "good") (fair . "fair")
+                 (poor . "marginal") (closed . "closed"))))))))
+
+(defun ham-spacewx--insert-legend (entries)
+  "Insert ENTRIES as a row of coloured words, wrapped to the panel width.
+ENTRIES is an alist of text to face.  Wrapping rather than truncating,
+because every band in the list is a band somebody asked to see."
+  (let ((margin (make-string ham-spacewx--sparkline-indent ?\s))
+        (column ham-spacewx--sparkline-indent))
+    (insert margin)
+    (dolist (entry entries)
+      (let ((width (string-width (car entry))))
+        (when (and (> column ham-spacewx--sparkline-indent)
+                   (> (+ column width) ham-spacewx-panel-width))
+          (insert "\n" margin)
+          (setq column ham-spacewx--sparkline-indent))
+        (insert (propertize (car entry) 'face (cdr entry)) " ")
+        (setq column (+ column width 1))))
+    (insert "\n")))
 
 (defun ham-spacewx--render-status ()
   "Insert a line per source that is not currently healthy."
@@ -2100,14 +2246,25 @@ cluttered with ages that all say the same thing."
                              ham-spacewx--sources))))
     (when notes
       (ham-spacewx--heading "Sources")
+      ;; A source in trouble gets its name on one line and the reason
+      ;; beneath it, rather than a name-and-value row: the reason is a
+      ;; sentence, often one the far end wrote, and there is no column
+      ;; wide enough to hold it.
       (dolist (entry notes)
-        (ham-spacewx--row (ham-spacewx-source-label (car entry))
-                          nil (cdr entry))
+        (insert "  " (propertize (ham-spacewx-source-label (car entry))
+                                 'face 'ham-spacewx-label)
+                "\n")
+        (let ((start (point)))
+          (ham-spacewx--wrap (cdr entry) ham-spacewx-panel-width
+                             ham-spacewx--sparkline-indent)
+          (put-text-property start (point) 'face 'ham-spacewx-stale))
         ;; A failure is only actionable if it says which address failed.
+        ;; The address is the one thing here left whole: an elided URL
+        ;; cannot be typed into a browser or handed to curl.
         (when (ham-spacewx--error (ham-spacewx-source-key (car entry)))
           (insert (propertize
-                   (format "  %s%s\n"
-                           (make-string ham-spacewx--label-width ?\s)
+                   (format "%s%s\n"
+                           (make-string ham-spacewx--sparkline-indent ?\s)
                            (ham-spacewx-source-url (car entry)))
                    'face 'ham-spacewx-stale))))
       (insert (propertize "\n  M-x ham-spacewx-diagnose for detail\n"
@@ -2156,20 +2313,20 @@ cluttered with ages that all say the same thing."
         (peak (ham-spacewx-xray-max))
         (flux (ham-spacewx-solar-flux))
         (protons (ham-spacewx-proton-flux)))
-    (ham-spacewx--row "X-ray" (or (ham-spacewx-xray-class now) "—")
-                      nil 'xray now)
-    (ham-spacewx--row "X-ray peak" (or (ham-spacewx-xray-class peak) "—")
-                      nil 'xray-max peak)
+    (ham-spacewx--row "X-ray" (ham-spacewx-xray-class now)
+                      nil nil 'xray now)
+    (ham-spacewx--row "X-ray peak" (ham-spacewx-xray-class peak)
+                      nil nil 'xray-max peak)
     (ham-spacewx--row "10.7 cm flux"
-                      (ham-spacewx--number-string flux "%.0f sfu")
-                      nil 'flux flux)
+                      (ham-spacewx--number-string flux "%.0f")
+                      "sfu" nil 'flux flux)
     (let ((ssn (ham-spacewx-sunspot-number)))
       (ham-spacewx--row "Sunspot number"
                         (ham-spacewx--number-string ssn "%.0f")
-                        nil 'sunspots ssn))
+                        nil nil 'sunspots ssn))
     (ham-spacewx--row "Proton >=10 MeV"
-                      (ham-spacewx--number-string protons "%.2f pfu")
-                      nil 'protons protons)))
+                      (ham-spacewx--compact-number protons)
+                      "pfu" nil 'protons protons)))
 
 (defun ham-spacewx--render-geomagnetic ()
   "Insert the geomagnetic section."
@@ -2178,10 +2335,10 @@ cluttered with ages that all say the same thing."
         (a (ham-spacewx-a-index)))
     (ham-spacewx--row "Planetary K"
                       (ham-spacewx--number-string kp "%.0f")
-                      (ham-spacewx-kp-description kp) 'kp kp)
+                      nil (ham-spacewx-kp-description kp) 'kp kp)
     (ham-spacewx--row "A index"
                       (ham-spacewx--number-string a "%.0f")
-                      nil 'a-index a)))
+                      nil nil 'a-index a)))
 
 (defun ham-spacewx--render-solar-wind ()
   "Insert the solar wind section.
@@ -2198,17 +2355,17 @@ beside it answers what it has been doing."
         (bt (ham-spacewx-bt))
         (bz (ham-spacewx-bz)))
     (ham-spacewx--row "Speed"
-                      (ham-spacewx--number-string speed "%.0f km/s")
-                      nil 'speed speed)
+                      (ham-spacewx--number-string speed "%.0f")
+                      "km/s" nil 'speed speed)
     (ham-spacewx--row "Density"
-                      (ham-spacewx--number-string density "%.1f p/cm³")
-                      nil 'density density)
+                      (ham-spacewx--number-string density "%.1f")
+                      "p/cm³" nil 'density density)
     (ham-spacewx--row "Bt"
-                      (ham-spacewx--number-string bt "%.1f nT")
-                      nil 'bt bt)
+                      (ham-spacewx--number-string bt "%.1f")
+                      "nT" nil 'bt bt)
     (ham-spacewx--row "Bz"
-                      (ham-spacewx--number-string bz "%.1f nT")
-                      (ham-spacewx-bz-description bz) 'bz bz)))
+                      (ham-spacewx--number-string bz "%.1f")
+                      "nT" (ham-spacewx-bz-description bz) 'bz bz)))
 
 (defun ham-spacewx--render ()
   "Redraw the panel into the current buffer."
@@ -2220,19 +2377,22 @@ beside it answers what it has been doing."
                                      (ham-spacewx--age
                                       (ham-spacewx-source-key source)))
                                    ham-spacewx--sources)))
-           (oldest (and ages (seq-max ages)))
-           (minutes (and oldest (floor (/ oldest 60)))))
+           (oldest (and ages (seq-max ages))))
       (insert (propertize
                (format "   NOAA SWPC%s\n"
-                       (if (and minutes (> minutes 0))
-                           (format ", oldest reading %d min" minutes)
+                       (if (and oldest (>= oldest 60))
+                           (format ", oldest %s"
+                                   (ham-spacewx--duration-label oldest))
                          ""))
                'face 'ham-spacewx-label)))
     (ham-spacewx--render-scales)
+    ;; Propagation first.  It is the question the rest of the panel is
+    ;; evidence for, and an operator who reads one section reads this
+    ;; one; the indices behind it follow for whoever wants them.
+    (ham-spacewx--render-propagation)
     (ham-spacewx--render-solar)
     (ham-spacewx--render-geomagnetic)
     (ham-spacewx--render-solar-wind)
-    (ham-spacewx--render-propagation)
     (ham-spacewx--render-status)
     ;; Column padding leaves trailing spaces on rows that carry neither a
     ;; description nor a sparkline.  They are invisible until someone
@@ -2387,27 +2547,36 @@ been killed stops the timer rather than leaving it running."
     (princ "  w    show the exact solar wind record in use\n")
     (princ "  q    bury the panel\n\n")
     (princ "Reading the panel\n")
-    (princ "  The bracketed span after each name is how much time the\n")
-    (princ "  sparkline beneath it covers.\n")
-    (princ "  Values and sparkline samples are coloured by severity, so\n")
-    (princ "  when a disturbance began is visible in the trace.\n")
-    (princ "  Bz is drawn about zero: the middle of the ramp is zero, so\n")
-    (princ "  a trace sitting low spent that window southward.  The plus\n")
-    (princ "  or minus figure after it is the full height of the trace.\n\n")
+    (princ "  Numbers line up on one column and units on the next,\n")
+    (princ "  so a section can be read straight down.\n")
+    (princ "  Words beside a reading describe that reading.  Words\n")
+    (princ "  after a sparkline describe the trace: how long it\n")
+    (princ "  covers, and how far its ramp reaches.  When a feed has\n")
+    (princ "  aged out, the age replaces the range there.\n")
+    (princ "  Values and sparkline samples are coloured by severity,\n")
+    (princ "  so when a disturbance began is visible in the trace.\n")
+    (princ "  Bz is drawn about zero: the middle of the ramp is zero,\n")
+    (princ "  so a trace sitting low spent that window southward, and\n")
+    (princ "  the plus or minus figure is the height of the trace.\n\n")
     (princ "Readings\n")
-    (princ "  10.7 cm flux   Solar radio flux in solar flux units.  Higher\n")
-    (princ "                 values raise the maximum usable frequency.\n")
-    (princ "  X-ray          GOES 0.1-0.8 nm band as a flare class.  M and X\n")
-    (princ "                 flares cause shortwave fadeout on the sunlit side.\n")
-    (princ "  Planetary K    Geomagnetic disturbance, 0 to 9.  5 and above is\n")
-    (princ "                 a storm and degrades polar and high latitude paths.\n")
-    (princ "  Speed          Solar wind speed.  Sustained high speed streams\n")
-    (princ "                 drive recurring disturbance.\n")
-    (princ "  Bz             North-south interplanetary field.  Sustained\n")
-    (princ "                 southward field couples energy in and precedes\n")
-    (princ "                 geomagnetic activity.\n\n")
+    (princ "  MUF        Highest frequency a 3000 km F2 hop returns,\n")
+    (princ "             estimated from flux and your locator.  It is\n")
+    (princ "             a model, not a measurement.\n")
+    (princ "  Absorption Lowest frequency that survives the D layer.\n")
+    (princ "  10.7 cm    Solar radio flux.  Higher values raise the\n")
+    (princ "             maximum usable frequency.\n")
+    (princ "  X-ray      GOES 0.1-0.8 nm band as a flare class.  M and\n")
+    (princ "             X flares fade out the sunlit side.\n")
+    (princ "  Planetary K  Geomagnetic disturbance, 0 to 9.  5 and\n")
+    (princ "             above is a storm and degrades polar and high\n")
+    (princ "             latitude paths.\n")
+    (princ "  Speed      Solar wind speed.  Sustained high speed\n")
+    (princ "             streams drive recurring disturbance.\n")
+    (princ "  Bz         North-south interplanetary field.  Sustained\n")
+    (princ "             southward field couples energy in and\n")
+    (princ "             precedes geomagnetic activity.\n\n")
     (princ "Data from the NOAA Space Weather Prediction Center.\n")
-    (princ "Real time solar wind comes from DSCOVR; ACE is the backup.\n")))
+    (princ "Real time solar wind is DSCOVR; ACE is the backup.\n")))
 
 ;;;###autoload
 (defun ham-spacewx ()

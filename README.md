@@ -330,12 +330,42 @@ geomagnetic storm — as they stand now and as they peaked over the last 24 hour
 A storm that has already passed still shaped the day's propagation, so both
 matter.
 
-Each reading is drawn as a sparkline beneath it, thirty characters wide whatever
-the feed's cadence, so rows covering the same period line up column for column.
-The bracketed note after a name says how long the trace covers and what its top
-and bottom mean: `Speed (59 min, 375–425)` is an hour of data spanning those
-figures. Bz is drawn about zero, since its sign is the whole point, and reports
-its half height instead: a trace sitting low spent that window southward.
+The propagation estimate comes first, because it is the question the rest of the
+panel is evidence for. The indices behind it follow.
+
+The panel lays itself out to fifty columns — `ham-spacewx-panel-width` — so it
+can sit in a side window beside the log or the rig panel without wrapping.
+Numbers are right aligned on one column and their units left aligned on the
+next, so a section reads straight down:
+
+```
+Propagation (estimated)
+  MUF, 3000 km hop     26.5 MHz
+  MUF in 12 h          10.1 MHz
+  Absorption floor      6.6 MHz
+  Bands by day
+    160m 80m 40m 30m 20m 17m 15m 12m 10m 6m
+  Bands at night
+    160m 80m 40m 30m 20m 17m 15m 12m 10m 6m
+    good fair marginal closed
+
+Solar wind (DSCOVR)
+  Speed                 527 km/s
+    **++==~~--..__..--~~=++***##  6 h, 385–526
+  Bz                    5.0 nT    northward
+    ~-..._____..--~==++**#####**  15 h, ±7
+```
+
+Each reading is drawn as a sparkline beneath it, one width across the panel
+whatever the feed's cadence, so rows covering the same period line up column for
+column. Words are placed by what they describe. Beside a value are the words
+interpreting that value — `northward`, `minor G1`. After a trace are the facts
+about the trace: how long it covers and what its top and bottom mean, so
+`6 h, 385–526` is six hours of data spanning those figures. When a feed has aged
+out, the age takes that place instead, since a number you cannot date matters
+more than the height of its ramp. Bz is drawn about zero, since its sign is the
+whole point, and reports its half height instead: a trace sitting low spent that
+window southward.
 
 Values, traces and the words beside them share one set of colours. Readings that
 feed a NOAA scale are coloured on that scale, so the panel and the published
@@ -378,9 +408,12 @@ one spacecraft so you can compare like with like.
 
 ### Propagation estimate
 
-Set `ham-station-grid` to your locator and the panel adds an estimated maximum
-usable frequency for a 3000 km hop, an absorption floor, and per-band summaries
-for day and night — the evening's bands being the thing worth planning around.
+Set `ham-station-grid` to your locator and the panel opens with an estimated
+maximum usable frequency for a 3000 km hop now and twelve hours out, an
+absorption floor, and per-band summaries for day and night — the evening's bands
+being the thing worth planning around. Now and twelve hours out are two rows
+rather than one row and a parenthesis, so they share a column and can be
+compared by looking down it.
 
 **This is a model, not a measurement.** It predicts the ionosphere from solar and
 geomagnetic indices; an ionosonde network measures it directly. Where the two
@@ -430,6 +463,7 @@ argued about.
 | `ham-band-default-frequencies` | digital calling | Where `b` moves on each band |
 | `ham-station-grid` | `nil` | Your Maidenhead locator |
 | `ham-spacewx-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
+| `ham-spacewx-panel-width` | `50` | Columns the panel lays itself out to |
 | `ham-spacewx-metric-views` | per reading | Window and width of each sparkline |
 | `ham-spacewx-noaa-scales` | R, S, G | Thresholds each scale's levels begin at |
 | `ham-spacewx-severity-thresholds` | per reading | Where an unscaled reading turns |
