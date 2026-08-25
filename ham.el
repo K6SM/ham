@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -365,7 +365,96 @@ A newline is appended if STRING does not already end with one."
          nil)))))
 
 
+;;;; Station
+
+(defcustom ham-station-grid nil
+  "The operator's Maidenhead locator, or nil if not set.
+
+Shared station identity rather than any one package's setting: a
+propagation estimate needs it to place the observer, a logger needs it
+to work out bearings and distances, and a greyline map needs it to
+centre itself.  Four, six or eight characters."
+  :type '(choice (const :tag "Not set" nil) string)
+  :group 'ham)
+
+(defun ham-station-latlon ()
+  "Return (LATITUDE . LONGITUDE) for `ham-station-grid', or nil.
+Returns nil rather than signalling when the grid is unset or malformed,
+so a caller can offer to do without a location."
+  (when (and ham-station-grid (stringp ham-station-grid))
+    (ignore-errors (ham-maidenhead-to-latlon ham-station-grid))))
+
+
 ;;;; Geodesy
+
+(defconst ham-geomagnetic-pole '(80.7 . -72.7)
+  "Latitude and longitude of the north geomagnetic pole.
+An approximate dipole position.  The pole drifts, so this is accurate
+enough for deciding whether a path is a high latitude one and not for
+anything that needs the real field.")
+
+(defun ham-geomagnetic-latitude (lat lon)
+  "Return the approximate geomagnetic latitude of LAT and LON, in degrees.
+
+Ionospheric behaviour follows the magnetic field rather than geography:
+auroral absorption and storm depression of the F2 layer are organised
+about the geomagnetic pole, which sits well away from the geographic
+one.  A station in Scotland and one at the same geographic latitude in
+Siberia do not see the same ionosphere."
+  (let* ((rad (/ float-pi 180.0))
+         (lat-r (* lat rad))
+         (pole-lat (* (car ham-geomagnetic-pole) rad))
+         (delta (* (- lon (cdr ham-geomagnetic-pole)) rad)))
+    (/ (asin (max -1.0 (min 1.0
+                            (+ (* (sin lat-r) (sin pole-lat))
+                               (* (cos lat-r) (cos pole-lat) (cos delta))))))
+       rad)))
+
+(defun ham-solar-position (&optional time)
+  "Return (DECLINATION . EQUATION-OF-TIME) for TIME, in degrees and minutes.
+TIME defaults to now.  A standard low precision solar position, good to
+a fraction of a degree, which is far finer than an ionospheric estimate
+can use."
+  (let* ((now (or time (current-time)))
+         (day (string-to-number (format-time-string "%j" now t)))
+         (rad (/ float-pi 180.0))
+         (gamma (* (/ (* 2 float-pi) 365.0) (- day 1)))
+         (declination
+          (/ (- 0.006918
+                (* 0.399912 (cos gamma)) (- (* 0.070257 (sin gamma)))
+                (* 0.006758 (cos (* 2 gamma))) (- (* 0.000907 (sin (* 2 gamma))))
+                (* 0.002697 (cos (* 3 gamma))) (- (* 0.00148 (sin (* 3 gamma)))))
+             rad))
+         (equation
+          (* 229.18
+             (- 0.000075
+                (* 0.001868 (cos gamma)) (- (* 0.032077 (sin gamma)))
+                (* 0.014615 (cos (* 2 gamma))) (- (* 0.040849 (sin (* 2 gamma))))))))
+    (cons declination equation)))
+
+(defun ham-solar-zenith-cosine (lat lon &optional time)
+  "Return the cosine of the solar zenith angle at LAT and LON at TIME.
+TIME defaults to now.
+
+One is the sun overhead, zero the horizon, negative night.  Ionisation
+of both the F2 and D layers follows this closely, so it is the single
+most important quantity in any propagation estimate: it is what makes
+the difference between a band being open and shut."
+  (let* ((solar (ham-solar-position time))
+         (declination (car solar))
+         (equation (cdr solar))
+         (rad (/ float-pi 180.0))
+         (minutes (+ (* 60.0 (string-to-number
+                              (format-time-string "%H" (or time (current-time)) t)))
+                     (string-to-number
+                      (format-time-string "%M" (or time (current-time)) t))))
+         (true-solar (+ minutes equation (* 4.0 lon)))
+         (hour-angle (- (/ true-solar 4.0) 180.0)))
+    (max -1.0
+         (min 1.0
+              (+ (* (sin (* lat rad)) (sin (* declination rad)))
+                 (* (cos (* lat rad)) (cos (* declination rad))
+                    (cos (* hour-angle rad))))))))
 
 (defun ham-maidenhead-to-latlon (grid)
   "Return (LATITUDE . LONGITUDE) for the centre of Maidenhead GRID.
