@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -60,48 +60,123 @@
   :prefix "ham-")
 
 
-;;;; Logging and instrumentation
+;;;; Shared faces
 
-(defcustom ham-debug nil
-  "When non-nil, record diagnostic messages in `ham-log-buffer-name'.
-This is intended to stay off in normal use; the logging path is
-cheap but not free, and it is on the hot path for rig polling."
-  :type 'boolean
+;; Every face here inherits a standard one, so the panels follow whatever
+;; theme is loaded instead of imposing colours of their own.  This is what
+;; `adif.el' already does by leaning on font-lock, and it is why a field
+;; name in the rig panel, in the QSO form and in an ADIF file all come out
+;; the same colour.
+;;
+;; The NOAA space weather scales are the one deliberate exception: their
+;; green to magenta progression is published and carries meaning, so those
+;; faces keep literal colours.
+
+(defface ham-face-label '((t :inherit font-lock-keyword-face))
+  "Face for field names and row labels."
   :group 'ham)
 
-(defcustom ham-log-buffer-name "*ham-log*"
-  "Name of the buffer used for diagnostic logging."
-  :type 'string
+(defface ham-face-value '((t :inherit default))
+  "Face for readings and values."
   :group 'ham)
 
-(defcustom ham-log-max-lines 2000
-  "Maximum number of lines retained in the log buffer."
-  :type 'integer
+(defface ham-face-unit '((t :inherit font-lock-string-face))
+  "Face for units and the ranges a reading is measured against."
   :group 'ham)
 
-(defun ham-log (format-string &rest args)
-  "Append a diagnostic line to the log buffer when `ham-debug' is non-nil.
-FORMAT-STRING and ARGS are passed to `format'."
-  (when ham-debug
-    (let ((line (apply #'format format-string args))
-          (stamp (format-time-string "%H:%M:%S.%3N")))
-      (with-current-buffer (get-buffer-create ham-log-buffer-name)
-        (let ((inhibit-read-only t))
-          (save-excursion
-            (goto-char (point-max))
-            (insert stamp " " line "\n")
-            (when (> (line-number-at-pos (point-max)) ham-log-max-lines)
-              (goto-char (point-min))
-              (forward-line (- (line-number-at-pos (point-max))
-                               ham-log-max-lines))
-              (delete-region (point-min) (point)))))))))
+(defface ham-face-note '((t :inherit font-lock-comment-face))
+  "Face for the lines at the top of a panel, and for help text."
+  :group 'ham)
 
-;;;###autoload
-(defun ham-show-log ()
-  "Display the diagnostic log buffer."
-  (interactive)
-  (pop-to-buffer (get-buffer-create ham-log-buffer-name))
-  (special-mode))
+(defface ham-face-heading '((t :inherit bold))
+  "Face for section headings within a panel."
+  :group 'ham)
+
+(defface ham-face-ok '((t :inherit success))
+  "Face for a good state: connected, receiving, band open."
+  :group 'ham)
+
+(defface ham-face-warn '((t :inherit warning))
+  "Face for a state worth noticing but not acting on."
+  :group 'ham)
+
+(defface ham-face-danger '((t :inherit error))
+  "Face for a state needing attention: transmitting, band closed."
+  :group 'ham)
+
+(defface ham-face-stale '((t :inherit shadow :slant italic))
+  "Face for a reading old enough to be misleading."
+  :group 'ham)
+
+
+;;;; Shared panel furniture
+
+(defconst ham-panel-indent "  "
+  "Indentation for the body of a panel, below its opening lines.")
+
+(defun ham-note-line (text)
+  "Return TEXT as a quiet line in `ham-face-note'.
+The face is appended rather than imposed, so a word TEXT has already
+coloured -- a connection state, a band condition -- keeps its own colour
+and only the rest of the line goes quiet."
+  (let ((line (copy-sequence text)))
+    (add-face-text-property 0 (length line) 'ham-face-note t line)
+    line))
+
+(defun ham-panel-header (title &optional hints)
+  "Return the lines every panel opens with.
+TITLE names what is being looked at.  HINTS is a short reminder of the
+keys worth knowing, with the full list left to the help buffer."
+  (concat (ham-note-line title) "\n"
+          (if hints (concat (ham-note-line hints) "\n") "")
+          "\n"))
+
+(defun ham-key-rows (keymap)
+  "Return (KEY . SUMMARY) for every command bound in KEYMAP, sorted by key."
+  (let (rows)
+    (map-keymap
+     (lambda (event definition)
+       (when (commandp definition)
+         (push (cons (key-description (vector event))
+                     (let ((doc (documentation definition)))
+                       (if doc (car (split-string doc "\n")) "")))
+               rows)))
+     keymap)
+    ;; `map-keymap' walks in reverse insertion order, which is no order at
+    ;; all to read a key list in.
+    (sort rows (lambda (a b) (string-lessp (car a) (car b))))))
+
+(defun ham-insert-key-table (title keymap)
+  "Insert a table of the bindings in KEYMAP under TITLE."
+  (insert (propertize (concat title "\n") 'face 'ham-face-heading))
+  (dolist (row (ham-key-rows keymap))
+    (insert (format "%s%-12s %s\n" ham-panel-indent
+                    (propertize (car row) 'face 'ham-face-label)
+                    (cdr row))))
+  (insert "\n"))
+
+(defun ham-insert-legend (title entries)
+  "Insert ENTRIES under TITLE as coloured label and explanation pairs.
+ENTRIES is a list of (TEXT FACE EXPLANATION), and TEXT is shown in FACE
+so the help says what a colour means by showing it."
+  (insert (propertize (concat title "\n") 'face 'ham-face-heading))
+  (dolist (entry entries)
+    (insert (format "%s%s %s\n" ham-panel-indent
+                    (propertize (format "%-12s" (nth 0 entry)) 'face (nth 1 entry))
+                    (nth 2 entry))))
+  (insert "\n"))
+
+(defmacro ham-with-help-buffer (name title &rest body)
+  "Render a help buffer called NAME headed by TITLE, running BODY to fill it."
+  (declare (indent 2))
+  `(with-current-buffer (get-buffer-create ,name)
+     (let ((inhibit-read-only t))
+       (erase-buffer)
+       (insert (ham-panel-header ,title))
+       ,@body
+       (goto-char (point-min)))
+     (special-mode)
+     (pop-to-buffer (current-buffer))))
 
 
 ;;;; Event bus
@@ -136,7 +211,6 @@ published the event, which may be a process filter."
   "Publish an event on TOPIC, calling each subscriber with ARGS.
 Errors signalled by a subscriber are demoted to messages so that one
 bad handler cannot break the publisher or the other subscribers."
-  (ham-log "publish %s %S" topic args)
   (dolist (entry (gethash topic ham--subscribers))
     (with-demoted-errors "ham-publish: subscriber error: %S"
       (apply (cdr entry) args))))
@@ -181,6 +255,22 @@ that the terminal path is a designed fallback and not an afterthought."
   :type 'number
   :group 'ham)
 
+(defcustom ham-connect-timeout 5.0
+  "Seconds to allow a connection attempt to be answered.
+
+A host that is switched off or behind a firewall never answers at all.
+Opening the socket does not block Emacs, but without a deadline of our
+own the attempt sits pending for as long as the operating system keeps
+retrying, which can be minutes, and the panel has nothing to say for
+the whole of it."
+  :type 'number
+  :group 'ham)
+
+(defcustom ham-supervise-interval 1.0
+  "Seconds between checks on the state of every open connection."
+  :type 'number
+  :group 'ham)
+
 (cl-defstruct (ham-connection (:constructor ham--connection-create)
                               (:copier nil))
   "A line-oriented asynchronous TCP connection."
@@ -190,7 +280,8 @@ that the terminal path is a designed fallback and not an afterthought."
   (state 'disconnected)
   (auto-reconnect t)
   (backoff nil)
-  (reconnect-timer nil)
+  (attempt-started nil)
+  (next-retry 0)
   (lines-in 0)
   (lines-out 0))
 
@@ -205,8 +296,6 @@ that the terminal path is a designed fallback and not an afterthought."
   "Set CONN state to STATE and notify its status callback with DETAIL."
   (unless (eq (ham-connection-state conn) state)
     (setf (ham-connection-state conn) state)
-    (ham-log "%s: state -> %s%s" (ham-connection-name conn) state
-             (if detail (format " (%s)" detail) ""))
     (when (ham-connection-on-status conn)
       (with-demoted-errors "ham-connection: status handler error: %S"
         (funcall (ham-connection-on-status conn) state detail)))))
@@ -221,7 +310,6 @@ that the terminal path is a designed fallback and not an afterthought."
     (while (setq idx (string-search "\n" text start))
       (let ((line (string-trim-right (substring text start idx) "\r")))
         (cl-incf (ham-connection-lines-in conn))
-        (ham-log "%s < %s" (ham-connection-name conn) line)
         (when (ham-connection-on-line conn)
           (with-demoted-errors "ham-connection: line handler error: %S"
             (funcall (ham-connection-on-line conn) line))))
@@ -240,50 +328,108 @@ make a perfectly good socket look idle to `ham-connection-live-p'."
          (memq (process-status process) '(open connect))
          t)))
 
-(defun ham--connection-cancel-reconnect (conn)
-  "Cancel any reconnection pending for CONN."
-  (when (ham-connection-reconnect-timer conn)
-    (cancel-timer (ham-connection-reconnect-timer conn))
-    (setf (ham-connection-reconnect-timer conn) nil)))
+;; Reconnection is supervised rather than chained.  A single repeating
+;; timer asks every connection the same question -- are you where you
+;; should be? -- and acts on the answer.  The chain of one-shot timers
+;; this replaces had a branch that cleared its own timer, found the
+;; socket busy but not yet open, and returned having armed nothing.  More
+;; generally a pending connect could sit for the length of the kernel's
+;; TCP retry with no deadline and no timer, leaving the panel inert with
+;; nothing to report.  A supervisor cannot lose track like that:
+;; whatever state a connection is left in, the next tick reconsiders it.
 
-(defun ham--connection-schedule-reconnect (conn)
-  "Arrange for CONN to be retried after its current backoff delay."
-  (when (and (ham-connection-auto-reconnect conn)
-             (not (ham-connection-reconnect-timer conn)))
-    (let ((delay (or (ham-connection-backoff conn)
-                     ham-reconnect-initial-delay)))
-      (setf (ham-connection-backoff conn)
-            (min ham-reconnect-max-delay (* 2 delay)))
-      (ham--connection-set-state conn 'reconnecting (format "%.1fs" delay))
-      (setf (ham-connection-reconnect-timer conn)
-            (run-at-time delay nil
-                         (lambda ()
-                           (setf (ham-connection-reconnect-timer conn) nil)
-                           ;; Never reopen a connection whose socket has come
-                           ;; back in the meantime: doing so deletes a working
-                           ;; process, which schedules another reconnect, and
-                           ;; the connection then flaps forever at the backoff
-                           ;; interval.
-                           (if (ham--connection-socket-busy-p conn)
-                               (when (eq (process-status
-                                          (ham-connection-process conn))
-                                         'open)
-                                 (ham--connection-set-state conn 'connected))
-                             (ham-connection-open conn))))))))
+(defvar ham--connections nil
+  "Connections currently under supervision.")
+
+(defvar ham--supervisor-timer nil
+  "The repeating timer that watches every connection, or nil.")
+
+(defun ham--supervisor-ensure ()
+  "Make sure the supervisor is running."
+  (unless (timerp ham--supervisor-timer)
+    (setq ham--supervisor-timer
+          (run-at-time ham-supervise-interval ham-supervise-interval
+                       #'ham--supervise))))
+
+(defun ham--supervisor-maybe-stop ()
+  "Stop the supervisor when it has nothing left to watch."
+  (when (and (null ham--connections) (timerp ham--supervisor-timer))
+    (cancel-timer ham--supervisor-timer)
+    (setq ham--supervisor-timer nil)))
+
+(defun ham--connection-register (conn)
+  "Put CONN under supervision."
+  (cl-pushnew conn ham--connections :test #'eq)
+  (ham--supervisor-ensure))
+
+(defun ham--connection-unregister (conn)
+  "Take CONN out of supervision."
+  (setq ham--connections (delq conn ham--connections))
+  (ham--supervisor-maybe-stop))
+
+(defun ham-connection-retry-in (conn)
+  "Return seconds until CONN is next retried, or nil if it is not waiting.
+
+A connection that has been closed is not waiting for anything: it is
+disconnected and staying that way, and reporting a countdown of zero
+for it would have a panel say it was about to reconnect forever."
+  (when (and conn
+             (ham-connection-auto-reconnect conn)
+             (memq (ham-connection-state conn) '(disconnected reconnecting)))
+    (max 0 (- (or (ham-connection-next-retry conn) 0) (float-time)))))
+
+(defun ham--connection-wait (conn detail)
+  "Put CONN into the waiting state after DETAIL, backing off each time."
+  (let ((delay (or (ham-connection-backoff conn) ham-reconnect-initial-delay)))
+    (setf (ham-connection-backoff conn)
+          (min ham-reconnect-max-delay (* 2 delay)))
+    (setf (ham-connection-next-retry conn) (+ (float-time) delay))
+    (setf (ham-connection-attempt-started conn) nil)
+    (ham--connection-set-state
+     conn 'reconnecting (format "%s, retrying in %.1fs" detail delay))))
+
+(defun ham--connection-supervise (conn)
+  "Move CONN towards where it should be, if it is not there already."
+  (pcase (ham-connection-state conn)
+    ('connecting
+     (let ((started (ham-connection-attempt-started conn)))
+       (when (and started (> (- (float-time) started) ham-connect-timeout))
+         (ham--connection-discard-process conn)
+         (ham--connection-wait
+          conn (format "no answer within %gs" ham-connect-timeout)))))
+    ((or 'disconnected 'reconnecting)
+     (cond
+      ((not (ham-connection-auto-reconnect conn)) nil)
+      ;; A socket that came back on its own is not to be torn down and
+      ;; reopened: that deletes a working process and starts the flapping
+      ;; this supervisor exists to prevent.
+      ((ham--connection-socket-busy-p conn)
+       (when (eq (process-status (ham-connection-process conn)) 'open)
+         (ham--connection-set-state conn 'connected)))
+      ((>= (float-time) (or (ham-connection-next-retry conn) 0))
+       (ham-connection-open conn))))
+    (_ nil)))
+
+(defun ham--supervise ()
+  "Check on every connection under supervision."
+  (dolist (conn (copy-sequence ham--connections))
+    (with-demoted-errors "ham-connection: supervisor error: %S"
+      (ham--connection-supervise conn))))
 
 (defun ham--connection-sentinel (conn event)
   "Handle a process EVENT for CONN."
   (cond
    ((string-prefix-p "open" event)
     (setf (ham-connection-backoff conn) ham-reconnect-initial-delay)
-    (ham--connection-cancel-reconnect conn)
+    (setf (ham-connection-attempt-started conn) nil)
+    (setf (ham-connection-next-retry conn) 0)
     (ham--connection-set-state conn 'connected))
    ((string-match-p "\\`\\(failed\\|connection broken\\)" event)
     (ham--connection-set-state conn 'disconnected (string-trim event))
-    (ham--connection-schedule-reconnect conn))
+    (ham--connection-wait conn (string-trim event)))
    ((string-match-p "\\`\\(deleted\\|finished\\|exited\\|killed\\)" event)
     (ham--connection-set-state conn 'disconnected (string-trim event))
-    (ham--connection-schedule-reconnect conn))))
+    (ham--connection-wait conn (string-trim event)))))
 
 (cl-defun ham-connection-make (&key name host port on-line on-status
                                     (auto-reconnect t))
@@ -314,6 +460,8 @@ does not need."
   "Open CONN asynchronously.  Return CONN."
   (ham--connection-discard-process conn)
   (setf (ham-connection-pending conn) "")
+  (setf (ham-connection-attempt-started conn) (float-time))
+  (ham--connection-register conn)
   (ham--connection-set-state conn 'connecting)
   (condition-case err
       (setf (ham-connection-process conn)
@@ -340,13 +488,14 @@ does not need."
                            (ham--connection-sentinel conn event)))))
     (error
      (ham--connection-set-state conn 'disconnected (error-message-string err))
-     (ham--connection-schedule-reconnect conn)))
+     (ham--connection-wait conn (error-message-string err))))
   conn)
 
 (defun ham-connection-close (conn)
-  "Close CONN and cancel any pending reconnection."
+  "Close CONN and stop trying to reach it."
   (setf (ham-connection-auto-reconnect conn) nil)
-  (ham--connection-cancel-reconnect conn)
+  (setf (ham-connection-attempt-started conn) nil)
+  (ham--connection-unregister conn)
   (ham--connection-discard-process conn)
   (ham--connection-set-state conn 'disconnected "closed"))
 
@@ -355,14 +504,10 @@ does not need."
 A newline is appended if STRING does not already end with one."
   (when (ham-connection-live-p conn)
     (let ((payload (if (string-suffix-p "\n" string) string (concat string "\n"))))
-      (ham-log "%s > %s" (ham-connection-name conn) (string-trim-right payload))
       (cl-incf (ham-connection-lines-out conn))
-      (condition-case err
+      (condition-case nil
           (progn (process-send-string (ham-connection-process conn) payload) t)
-        (error
-         (ham-log "%s: send failed: %s" (ham-connection-name conn)
-                  (error-message-string err))
-         nil)))))
+        (error nil)))))
 
 
 ;;;; Station

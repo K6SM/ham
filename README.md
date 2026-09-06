@@ -108,7 +108,6 @@ emulation, which gives you LAN remote operation with wfview carrying the audio.
 | `?` `h` | Every key, in a buffer |
 | `i` | Capabilities the radio reported |
 | `S` | Link statistics |
-| `L` | Diagnostic log (needs `ham-debug`) |
 
 ### Tuning
 
@@ -334,43 +333,55 @@ The propagation estimate comes first, because it is the question the rest of the
 panel is evidence for. The indices behind it follow.
 
 The panel lays itself out to fifty columns — `ham-spacewx-panel-width` — so it
-can sit in a side window beside the log or the rig panel without wrapping.
-Numbers are right aligned on one column and their units left aligned on the
-next, so a section reads straight down:
+can sit in a side window beside the log or the rig panel without wrapping:
 
 ```
-Propagation (estimated)
-  MUF, 3000 km hop     26.5 MHz
-  MUF in 12 h          10.1 MHz
-  Absorption floor      6.6 MHz
+Propagation for grid CM98jr
+  MUF, 3000 km hop (MHz)          26.4
+  MUF in 12 h (MHz)               9.7
+  Absorption floor (MHz)          6.4
   Bands by day
     160m 80m 40m 30m 20m 17m 15m 12m 10m 6m
   Bands at night
     160m 80m 40m 30m 20m 17m 15m 12m 10m 6m
-    good fair marginal closed
 
 Solar wind (DSCOVR)
-  Speed                 527 km/s
-    **++==~~--..__..--~~=++***##  6 h, 385–526
-  Bz                    5.0 nT    northward
-    ~-..._____..--~==++**#####**  15 h, ±7
+  Speed (km/s, 6 h, 250–800)
+    ~~~~~~~------------~~~~~~~~=  527
+  Bz (nT, 15 h, ±20)
+    ~~~~-------~~~~======++++++=  5.0 north
 ```
 
-Each reading is drawn as a sparkline beneath it, one width across the panel
-whatever the feed's cadence, so rows covering the same period line up column for
-column. Words are placed by what they describe. Beside a value are the words
-interpreting that value — `northward`, `minor G1`. After a trace are the facts
-about the trace: how long it covers and what its top and bottom mean, so
-`6 h, 385–526` is six hours of data spanning those figures. When a feed has aged
-out, the age takes that place instead, since a number you cannot date matters
+A reading takes two lines. The first names it and gives, in one parenthesis,
+everything about it that does not change between refreshes: its unit, how long
+its trace covers, and the scale that trace is drawn to. The second draws the
+trace and puts the number at the end of it, so every value in the panel lines up
+on the right hand end of its own sparkline — which is where the eye already is.
+The trace says what has been happening; the number finishes the sentence with
+what is happening now, and the words after it say what that means.
+
+Splitting them that way means the eye returning to the panel lands on what moved.
+A unit and a scale do not change; the number does.
+
+Sparklines are one width across the panel whatever the feed's cadence, so rows
+covering the same period line up column for column. When a feed has aged out,
+its age replaces the scale in the parenthesis: a number you cannot date matters
 more than the height of its ramp. Bz is drawn about zero, since its sign is the
-whole point, and reports its half height instead: a trace sitting low spent that
-window southward.
+whole point, and reports its half height instead — a trace sitting low spent
+that window southward.
 
 Values, traces and the words beside them share one set of colours. Readings that
 feed a NOAA scale are coloured on that scale, so the panel and the published
 alert level agree. The rest use the same palette to mean quiet, degraded and
 serious.
+
+Two things sit outside that palette. What is in parentheses wears the same quiet
+face as the panel's opening lines, because it is context rather than content and
+should not compete with the readings. The propagation figures wear a colour of
+their own, because nothing measured them: they are worked out from the indices
+above them, and the colour says so on every row without a word of caveat on any
+of them. An age in parentheses is the exception to the first rule — a reading
+that has stopped being current should not read as quietly as one that has not.
 
 | Key | Action |
 | --- | --- |
@@ -391,6 +402,23 @@ honest about its age; an empty panel tells you nothing. Any reading past
 
 A machine resuming from sleep finds every feed timing out at once. The panel
 notices the gap, waits for the network, and retries once.
+
+A feed can also arrive whole and carry nothing. GOES publishes a flux of exactly
+zero for every record while its X-ray instrument is down, rather than omitting
+them, and zero is not a quiet sun — the long band sits near 1e-8 at solar
+minimum and cannot physically reach zero. Drawn as data those zeros make a flat
+trace along the bottom of the ramp, in the colour of a quiet reading: a picture
+of six calm hours that were never observed. They are dropped instead, and the
+panel says `no data: every flux reads zero`. `ham-spacewx-xray-floor` sets where
+a measurement stops counting as one.
+
+`M-x ham-spacewx-diagnose` re-reads every feed and reports what each answered:
+the fields it carries, how many records survive being narrowed to one energy
+channel, how many of those carry a measurement, and the current value of every
+reading taken from it. The report updates itself as the feeds land. It is the
+first thing to run when a row is empty, because it separates a moved endpoint
+from a network problem from an instrument outage from a payload this package
+does not understand.
 
 ### Solar wind
 
@@ -414,6 +442,10 @@ absorption floor, and per-band summaries for day and night — the evening's ban
 being the thing worth planning around. Now and twelve hours out are two rows
 rather than one row and a parenthesis, so they share a column and can be
 compared by looking down it.
+
+The section is headed with the locator it was worked out for —
+`Propagation for grid CM98jr` — because whose ionosphere this is matters more
+than a reminder that it is modelled. That caveat is below, and in the help.
 
 **This is a model, not a measurement.** It predicts the ionosphere from solar and
 geomagnetic indices; an ionosonde network measures it directly. Where the two
@@ -471,12 +503,13 @@ argued about.
 | `ham-spacewx-wind-speed-field` | `proton` | Proton or alpha particle speed |
 | `ham-spacewx-max-quality` | `0` | Strictness of the feed's own grading |
 | `ham-spacewx-stale-after` | `3600` | When a reading is called old |
+| `ham-spacewx-xray-floor` | `1e-9` | Below this a flux is a gap, not a reading |
+| `ham-spacewx-xray-long-band-regexp` | `0.1-0.8` | How the long band is spelled |
 | `ham-spacewx-auto-refresh-interval` | `600` | Seconds between refreshes |
 | `ham-spacewx-obliquity-factor` | `3.2` | M(3000)F2, turning foF2 into a MUF |
 | `ham-spacewx-fof2-noon-per-sfi` | `0.04` | foF2 rise per solar flux unit |
 | `ham-spacewx-f2-peak-hour` | `14.0` | Local hour of the F2 maximum |
 | `ham-spacewx-bands` | 160m–6m | Bands the estimate reports on |
-| `ham-debug` | `nil` | Log every line to `*ham-log*` |
 
 Polling stops when no panel is visible and nothing has subscribed.
 
