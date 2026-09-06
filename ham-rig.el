@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.2
+;; Version: 0.1.3
 ;; Package-Requires: ((emacs "29.1") (ham "0.1.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -89,6 +89,7 @@
 ;;; Code:
 
 (require 'ham)
+(require 'easymenu)
 (require 'cl-lib)
 (require 'subr-x)
 (require 'text-property-search)
@@ -291,36 +292,32 @@ the rig, and only the words for them are local to a model."
   :group 'ham-rig)
 
 (defface ham-rig-label
-  '((t :inherit shadow))
+  '((t :inherit ham-face-label))
   "Face for field labels."
   :group 'ham-rig)
 
 (defface ham-rig-tx
-  '((t :inherit error :weight bold))
+  '((t :inherit ham-face-danger :weight bold))
   "Face for transmit indication."
   :group 'ham-rig)
 
 (defface ham-rig-rx
-  '((t :inherit success))
+  '((t :inherit ham-face-ok))
   "Face for receive indication."
   :group 'ham-rig)
 
 (defface ham-rig-meter
-  '((t :inherit font-lock-keyword-face))
+  '((t :inherit ham-face-label))
   "Face for the filled portion of meters."
   :group 'ham-rig)
 
 (defface ham-rig-meter-warn
-  '((((class color) (min-colors 88)) :foreground "goldenrod")
-    (((class color)) :foreground "yellow")
-    (t :inherit warning))
+  '((t :inherit ham-face-warn))
   "Face for the part of a meter that has reached a cautionary reading."
   :group 'ham-rig)
 
 (defface ham-rig-meter-danger
-  '((((class color) (min-colors 88)) :foreground "red")
-    (((class color)) :foreground "red")
-    (t :inherit error))
+  '((t :inherit ham-face-danger))
   "Face for the part of a meter that has reached a bad reading."
   :group 'ham-rig)
 
@@ -357,6 +354,8 @@ the rig, and only the words for them are local to a model."
 (defvar ham-rig--fast-timer nil)
 (defvar ham-rig--slow-timer nil)
 (defvar ham-rig--redisplay-timer nil)
+(defvar ham-rig--countdown-timer nil
+  "Repaints the panel once a second while the link is down.")
 (defvar ham-rig--step-index nil
   "Index into `ham-rig-tuning-steps', or nil until first needed.")
 (defvar ham-rig--levels (make-hash-table :test #'equal)
@@ -793,6 +792,7 @@ transmit."
   "React to connection STATE with DETAIL."
   (ham-publish ham-rig-topic-connection state detail)
   (setq ham-rig--dirty t)
+  (if (eq state 'connected) (ham-rig--stop-countdown) (ham-rig--start-countdown))
   (pcase state
     ('connected
      (setq ham-rig--inflight nil ham-rig--queue nil ham-rig--resp-lines nil
@@ -871,6 +871,7 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
   "Disconnect from rigctld."
   (interactive)
   (ham-rig--stop-timers)
+  (ham-rig--stop-countdown)
   (ham-rig--cancel-tx-watchdog)
   (when ham-rig--connection (ham-connection-close ham-rig--connection))
   (setq ham-rig--connection nil ham-rig--queue nil ham-rig--inflight nil
@@ -1269,24 +1270,50 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
                  (if (string-empty-p reading) "" (concat "  " reading))))))
    (ham-rig--tx-meters) ""))
 
-(defun ham-rig--render ()
-  "Return the panel contents as a string."
+(defun ham-rig--status-line ()
+  "Return the one line describing the radio link.
+
+Word for word and colour for colour the line the QSO logger shows at
+the top of its form, so one connection reads the same way in either
+buffer."
   (let* ((state (if ham-rig--connection
                     (ham-connection-state ham-rig--connection)
                   'disconnected))
-         (freq (ham-rig-frequency))
+         (where (propertize (format "%s:%d" ham-rig-host ham-rig-port)
+                            'face 'ham-face-label))
+         (retry (ham-connection-retry-in ham-rig--connection))
+         (shown
+          (pcase state
+            ('connected (propertize "connected" 'face 'ham-face-ok))
+            ('connecting (propertize "connecting" 'face 'ham-face-warn))
+            (_ (propertize (if (and retry (> retry 0))
+                               (format "reconnecting in %.1fs" retry)
+                             "not connected")
+                           'face 'ham-face-danger))))
+         (freq (ham-rig-get 'frequency))
+         (reading
+          (when (and (eq state 'connected) freq)
+            (concat "  " (propertize (format "%.6f" (/ freq 1000000.0))
+                                     'face 'ham-face-value)
+                    " " (propertize "MHz" 'face 'ham-face-unit)
+                    "  " (propertize (or (ham-rig-current-mode) "?")
+                                     'face 'ham-face-value)))))
+    (concat (propertize "Rig" 'face 'ham-face-label) "  " where "  " shown
+            (or reading ""))))
+
+(defun ham-rig--render ()
+  "Return the panel contents as a string."
+  (let* ((freq (ham-rig-frequency))
          (band (and freq (ham-band-for-frequency freq)))
          (tx (ham-rig-ptt-p))
          (db (ham-rig-get 'strength))
          (model (cdr (cl-assoc "Model name" ham-rig--caps :test #'cl-equalp))))
     (concat
-     "\n  "
-     (if model (concat (propertize model 'face 'ham-rig-label) "   ") "")
-     (propertize (symbol-name state)
-                 'face (if (eq state 'connected) 'ham-rig-rx 'ham-rig-label))
-     "   "
-     (propertize (format "%s:%d" ham-rig-host ham-rig-port) 'face 'ham-rig-label)
-     "\n\n  "
+     (ham-panel-header
+      (ham-rig--status-line)
+      (concat "? keys   g refresh   c connect   d disconnect   q bury"
+              (if model (concat "   " model) "")))
+     ham-panel-indent
      (propertize (if freq (ham-format-frequency freq) "---.---.---")
                  'face 'ham-rig-frequency)
      "   " (propertize (or band "") 'face 'ham-rig-label)
@@ -1295,7 +1322,7 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
        (if (>= step 1000)
            (format "%g k" (/ step 1000.0))
          (format "%d " step)))
-     "\n\n  "
+     "\n\n" ham-panel-indent
      (propertize "VFO " 'face 'ham-rig-label)
      (format "%-6s" (or (ham-rig-get 'vfo) "--"))
      (propertize "  MODE " 'face 'ham-rig-label)
@@ -1307,7 +1334,7 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
      (if (ham-rig-get 'split)
          (format "%s" (or (ham-rig-get 'split-vfo) "on"))
        "off")
-     "\n\n  "
+     "\n\n" ham-panel-indent
      (if tx
          (concat (propertize "TX" 'face 'ham-rig-tx)
                  (if ham-rig--tx-started-at
@@ -1322,12 +1349,6 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
                (ham-rig--bar (and db (/ (+ db 54.0) 114.0)) ham-rig-smeter-width)
                "  "
                (format "%-6s" (ham-rig--s-label db))))
-     "\n\n  "
-     (propertize "up/dn tune  M-up/dn x10  l/r step  f freq  m mode  b band"
-                 'face 'ham-rig-label)
-     "\n  "
-     (propertize "v vfo  s split  t ptt  T unkey  u tuner  A atu  C controls  ? keys"
-                 'face 'ham-rig-label)
      "\n")))
 
 (defun ham-rig--redisplay ()
@@ -1351,6 +1372,26 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
   (unless ham-rig--redisplay-timer
     (setq ham-rig--redisplay-timer
           (run-with-idle-timer 0.05 nil #'ham-rig--redisplay))))
+
+(defun ham-rig--countdown-tick ()
+  "Repaint so the reconnection countdown keeps moving."
+  (if (or (null ham-rig--connection)
+          (eq (ham-connection-state ham-rig--connection) 'connected))
+      (ham-rig--stop-countdown)
+    (setq ham-rig--dirty t)
+    (ham-rig--schedule-redisplay)))
+
+(defun ham-rig--start-countdown ()
+  "Keep the status line honest while the panel has nothing to poll."
+  (unless (timerp ham-rig--countdown-timer)
+    (setq ham-rig--countdown-timer
+          (run-at-time 1 1 #'ham-rig--countdown-tick))))
+
+(defun ham-rig--stop-countdown ()
+  "Stop repainting the reconnection countdown."
+  (when (timerp ham-rig--countdown-timer)
+    (cancel-timer ham-rig--countdown-timer))
+  (setq ham-rig--countdown-timer nil))
 
 
 ;;;; Controls discovered from the rig
@@ -1861,11 +1902,10 @@ stare at a screen of dashes."
   "+" #'ham-rig-control-increase
   "-" #'ham-rig-control-decrease
   "RET" #'ham-rig-control-toggle
-  "SPC" #'ham-rig-control-toggle
   "=" #'ham-rig-control-set
   "g" #'ham-rig-controls-refresh
   "?" #'ham-rig-help
-  "h" #'ham-rig-help
+  "q" #'quit-window
   "L" #'ham-show-log)
 
 (define-derived-mode ham-rig-controls-mode special-mode "Rig Controls"
@@ -1914,7 +1954,7 @@ and nothing it cannot."
   "c" #'ham-rig-connect
   "d" #'ham-rig-disconnect
   "?" #'ham-rig-help
-  "h" #'ham-rig-help
+  "q" #'quit-window
   "i" #'ham-rig-show-capabilities
   "u" #'ham-rig-toggle-tuner
   "A" #'ham-rig-tune-atu
@@ -1923,52 +1963,56 @@ and nothing it cannot."
   "S" #'ham-rig-show-stats
   "L" #'ham-show-log)
 
-(defun ham-rig--keymap-rows (keymap)
-  "Return (KEY . SUMMARY) for every command bound in KEYMAP."
-  (let (rows)
-    (map-keymap
-     (lambda (event definition)
-       (when (commandp definition)
-         (push (cons (key-description (vector event))
-                     (let ((doc (documentation definition)))
-                       (if doc (car (split-string doc "\n")) "")))
-               rows)))
-     keymap)
-    ;; `map-keymap' walks in reverse insertion order, which is no order
-    ;; at all to read a key list in.
-    (sort rows (lambda (a b) (string-lessp (car a) (car b))))))
+(easy-menu-define ham-rig-mode-menu ham-rig-mode-map
+  "Menu for `ham-rig-mode'."
+  '("Rig"
+    ["Set frequency" ham-rig-set-frequency :keys "f"]
+    ["Set mode" ham-rig-set-mode :keys "m"]
+    ["Set band" ham-rig-set-band :keys "b"]
+    ["Set tuning step" ham-rig-set-tuning-step :keys "."]
+    "---"
+    ["Swap VFO" ham-rig-toggle-vfo :keys "v"]
+    ["Split" ham-rig-toggle-split :keys "s"]
+    ["Antenna tuner" ham-rig-toggle-tuner :keys "u"]
+    ["Start ATU cycle" ham-rig-tune-atu :keys "A"]
+    "---"
+    ["Transmit" ham-rig-toggle-ptt :keys "t"]
+    ["Unkey now" ham-rig-panic-unkey :keys "T"]
+    "---"
+    ["Levels and functions" ham-rig-controls :keys "C"]
+    ["Rig capabilities" ham-rig-show-capabilities :keys "i"]
+    ["Link statistics" ham-rig-show-stats :keys "S"]
+    ["Show the ham log" ham-show-log :keys "L"]
+    "---"
+    ["Connect" ham-rig-connect :keys "c"]
+    ["Disconnect" ham-rig-disconnect :keys "d"]
+    ["Refresh" ham-rig-refresh :keys "g"]
+    "---"
+    ["Keys" ham-rig-help :keys "?"]
+    ["Customize" (lambda () (interactive) (customize-group 'ham-rig))]
+    "---"
+    ["Bury panel" quit-window :keys "q"]))
 
-(defun ham-rig--insert-key-table (title keymap)
-  "Insert a table of the bindings in KEYMAP under TITLE."
-  (insert (propertize (concat title "\n") 'face 'bold))
-  (dolist (row (ham-rig--keymap-rows keymap))
-    (insert (format "  %-12s %s\n"
-                    (propertize (car row) 'face 'ham-rig-meter)
-                    (cdr row))))
-  (insert "\n"))
-
-;;;###autoload
 (defun ham-rig-help ()
   "Show every key the rig panels bind."
   (interactive)
-  (with-current-buffer (get-buffer-create "*ham-rig-help*")
-    (let ((inhibit-read-only t))
-      (erase-buffer)
-      (ham-rig--insert-key-table "Rig panel" ham-rig-mode-map)
-      (ham-rig--insert-key-table "Controls panel" ham-rig-controls-mode-map)
-      (insert (propertize "Commands with no key\n" 'face 'bold))
-      (dolist (command '(ham-rig ham-rig-controls ham-rig-connect
-                                 ham-rig-disconnect ham-rig-power-on
-                                 ham-rig-power-off ham-rig-read-power-state
-                                 ham-rig-set-tuning-step ham-rig-show-stats
-                                 ham-rig-show-capabilities ham-rig-panic-unkey))
-        (insert (format "  %-28s %s\n"
-                        (symbol-name command)
-                        (let ((doc (documentation command)))
-                          (if doc (car (split-string doc "\n")) "")))))
-      (goto-char (point-min)))
-    (special-mode)
-    (pop-to-buffer (current-buffer))))
+  (ham-with-help-buffer "*ham-rig-help*" "Rig   keys"
+    (ham-insert-key-table "Rig panel" ham-rig-mode-map)
+    (ham-insert-key-table "Controls panel" ham-rig-controls-mode-map)
+    (ham-insert-legend
+     "Link states"
+     '(("connected" ham-face-ok "Talking to rigctld")
+       ("connecting" ham-face-warn "Waiting for rigctld to answer")
+       ("reconnecting" ham-face-danger "Link down; the countdown is the next try")))
+    (insert (propertize "Commands with no key\n" 'face 'ham-face-heading))
+    (dolist (command '(ham-rig ham-rig-controls ham-rig-connect
+                               ham-rig-disconnect ham-rig-power-on
+                               ham-rig-power-off ham-rig-read-power-state
+                               ham-rig-set-tuning-step ham-rig-show-stats
+                               ham-rig-show-capabilities ham-rig-panic-unkey))
+      (insert (format "%s%-28s %s\n" ham-panel-indent (symbol-name command)
+                      (let ((doc (documentation command)))
+                        (if doc (car (split-string doc "\n")) "")))))))
 
 (define-derived-mode ham-rig-mode special-mode "Rig"
   "Major mode for the transceiver control panel."

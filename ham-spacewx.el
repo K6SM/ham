@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.13.0
+;; Version: 0.15.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -99,9 +99,9 @@ after the trace loses its room and is elided.
     (xray     :samples 60 :units 28)
     (kp       :days 5 :units 28)
     (a-index  :days 5 :units 28)
-    (flux     :days 5 :units 28)
-    (xray-max :days 5 :units 28 :aggregate max)
-    (protons  :days 5 :units 28 :aggregate max)
+    (flux     :days 1 :units 28)
+    (xray-max :days 1 :units 28 :aggregate max)
+    (protons  :days 1 :units 28 :aggregate max)
     (sunspots :days 30 :units 28))
   "How much of each metric to draw, and how wide to draw it.
 
@@ -281,22 +281,41 @@ single number."
 ;;;; Faces
 
 (defface ham-spacewx-heading
-  '((t :inherit bold))
+  '((t :inherit ham-face-heading))
   "Face for section headings in the space weather panel."
   :group 'ham-spacewx)
 
 (defface ham-spacewx-label
-  '((t :inherit shadow))
+  '((t :inherit ham-face-label))
   "Face for reading labels."
   :group 'ham-spacewx)
 
 (defface ham-spacewx-value
-  '((t :inherit default))
+  '((t :inherit ham-face-value))
   "Face for reading values."
   :group 'ham-spacewx)
 
+(defface ham-spacewx-note
+  '((t :inherit ham-face-note))
+  "Face for the unit and scale named in parentheses after a reading.
+
+The same face the panel's opening lines wear.  What is in the
+parentheses is context rather than content -- it does not change
+between refreshes -- so it reads as the quiet furniture the header is
+and leaves the readings to carry the colour."
+  :group 'ham-spacewx)
+
+(defface ham-spacewx-estimate
+  '((t :inherit ham-face-unit))
+  "Face for a number this package worked out rather than read.
+
+The propagation figures are modelled from the indices above them, not
+measured by anything.  Wearing a colour of their own says so at a
+glance, without a word of caveat on every row."
+  :group 'ham-spacewx)
+
 (defface ham-spacewx-stale
-  '((t :inherit shadow :slant italic))
+  '((t :inherit ham-face-stale))
   "Face for readings old enough to be misleading."
   :group 'ham-spacewx)
 
@@ -337,7 +356,7 @@ single number."
   :group 'ham-spacewx)
 
 (defface ham-spacewx-sparkline
-  '((t :inherit shadow))
+  '((t :inherit ham-face-stale))
   "Face for sparklines."
   :group 'ham-spacewx)
 
@@ -793,8 +812,8 @@ bands."
   (pcase metric
     ((or 'speed 'density) (ham-spacewx--active-records 'wind))
     ((or 'bz 'bt) (ham-spacewx--active-records 'mag))
-    ('xray (ham-spacewx--xray-long-band))
-    ('xray-max (ham-spacewx--xray-long-band-of 'xray-long))
+    ('xray (ham-spacewx--xray-measurements 'xray))
+    ('xray-max (ham-spacewx--xray-measurements 'xray-long))
     ('protons (ham-spacewx--proton-channel))
     ((or 'kp 'a-index) (ham-spacewx--payload 'kindex))
     ('flux (ham-spacewx--payload 'flux))
@@ -941,25 +960,71 @@ is what makes the reading mean what its name says."
     (when values
       (/ (apply #'+ values) (float (length values))))))
 
-(defun ham-spacewx--xray-long-band ()
-  "Return the 0.1 to 0.8 nm band records only, dropping the short band.
+(defcustom ham-spacewx-xray-long-band-regexp "0*\\.10*-0*\\.80*"
+  "Pattern identifying the 0.1 to 0.8 nm records in the GOES X-ray feed.
+
+A setting because it is the one part of reading that feed which depends
+on how NOAA spells something rather than on what it publishes, and a
+spelling that stops matching empties the row without emptying the feed.
+The default tolerates 0.1-0.8, 0.10-0.80 and a space before the unit.
+
+If the X-ray row reads as a dash while the feed itself is healthy, this
+is the first thing to check: `ham-spacewx-diagnose' prints the energy
+values the feed actually carries."
+  :type 'regexp
+  :group 'ham-spacewx)
+
+(defun ham-spacewx--xray-long-band-of (key)
+  "Return the 0.1 to 0.8 nm records of the feed stored under KEY.
+
 The GOES feed interleaves two energy bands.  Drawing both produces a
 sawtooth that looks like violent variability and is really just the two
 bands alternating, so the band has to be selected before anything is
-plotted, not only before the value is read."
-  (seq-filter
-   (lambda (record)
-     (let ((energy (ham-spacewx--field record "energy")))
-       (or (null energy) (string-match-p "0\\.1-0\\.8" energy))))
-   (ham-spacewx--payload 'xray)))
+plotted, not only before the value is read.
 
-(defun ham-spacewx--xray-long-band-of (key)
-  "Return the 0.1 to 0.8 nm records of the feed stored under KEY."
+A record with no energy field at all is kept: a feed carrying one band
+has nothing to narrow."
   (seq-filter
    (lambda (record)
      (let ((energy (ham-spacewx--field record "energy")))
-       (or (null energy) (string-match-p "0\\.1-0\\.8" energy))))
+       (or (null energy)
+           (string-match-p ham-spacewx-xray-long-band-regexp energy))))
    (ham-spacewx--payload key)))
+
+(defun ham-spacewx--xray-long-band ()
+  "Return the 0.1 to 0.8 nm band records of the six hour feed."
+  (ham-spacewx--xray-long-band-of 'xray))
+
+(defcustom ham-spacewx-xray-floor 1.0e-9
+  "Smallest X-ray flux treated as a measurement rather than a gap.
+
+GOES publishes a flux of exactly zero while the instrument is down or
+the processing behind the feed has stalled, and it publishes it for
+every record rather than omitting them.  Zero is not a quiet sun: the
+long band sits near 1e-8 at solar minimum and cannot physically reach
+zero, so a zero is the absence of a measurement wearing the shape of
+one.
+
+Drawn as data it is worse than nothing -- a flat trace along the bottom
+of the ramp, in the colour of a quiet sun, which is a picture of six
+calm hours that were never observed.  Below this figure a record is
+dropped, so the row empties and the panel says the feed is not
+reporting."
+  :type 'number
+  :group 'ham-spacewx)
+
+(defun ham-spacewx--xray-measurements (key)
+  "Return the long band records under KEY that carry a real measurement.
+
+Both filters have to happen before anything is drawn rather than before
+the value is read: a trace is as much a claim about the sun as the
+number beside it, and one drawn from zeros claims something that was
+never measured."
+  (seq-filter
+   (lambda (record)
+     (let ((flux (ham-spacewx--number (ham-spacewx--field record "flux"))))
+       (and flux (>= flux ham-spacewx-xray-floor))))
+   (ham-spacewx--xray-long-band-of key)))
 
 (defun ham-spacewx--proton-channel ()
   "Return the 10 MeV integral proton records only.
@@ -1039,24 +1104,33 @@ the column beside the reading."
    ((< kp 9) "severe G4")
    (t "extreme G5")))
 
-(defun ham-spacewx-xray-class (flux)
+(defun ham-spacewx-xray-class (flux &optional decimals)
   "Return FLUX in W/m^2 as a flare class string such as \"B4.2\".
+
+DECIMALS is how much of the mantissa to keep, one by default.  Zero
+gives the coarse form -- A0, X10 -- which is what naming the ends of a
+scale wants: the range is there to say which decades the ramp covers,
+and a tenth of a class is detail at the wrong altitude for that.
+
 Returns nil if FLUX is nil."
   (when (and flux (> flux 0))
-    (let* ((bands '((1.0e-4 . "X") (1.0e-5 . "M") (1.0e-6 . "C")
+    (let* ((decimals (or decimals 1))
+           (bands '((1.0e-4 . "X") (1.0e-5 . "M") (1.0e-6 . "C")
                     (1.0e-7 . "B") (1.0e-8 . "A")))
            (band (seq-find (lambda (b) (>= flux (car b))) bands))
            (index (and band (seq-position bands band)))
            (letter (if band (cdr band) "A"))
+           (scale (expt 10 decimals))
            (mantissa (/ flux (if band (car band) 1.0e-8))))
       ;; A flux a hair under a threshold rounds up to ten and prints as
       ;; B10.0, which is not a flare class anyone writes: that is C1.0.
       ;; X has no band above it and does run past ten, so it is left
       ;; alone.
-      (when (and index (> index 0) (>= (round (* 10 mantissa)) 100))
+      (when (and index (> index 0)
+                 (>= (/ (round (* mantissa scale)) (float scale)) 10))
         (setq letter (cdr (nth (1- index) bands))
               mantissa 1.0))
-      (format "%s%.1f" letter mantissa))))
+      (format (format "%%s%%.%df" decimals) letter mantissa))))
 
 (defun ham-spacewx-bz-description (bz)
   "Return a plain description of field component BZ.
@@ -1064,10 +1138,10 @@ Southward field is the condition that matters, so it is what gets
 called out."
   (cond
    ((null bz) "")
-   ((> bz 1.0) "northward")
+   ((> bz 1.0) "north")
    ((> bz -2.0) "neutral")
-   ((> bz -8.0) "southward")
-   (t "strong southward")))
+   ((> bz -8.0) "south")
+   (t "very south")))
 
 
 ;;;; Severity
@@ -1107,6 +1181,7 @@ not hex codes."
     (bt      above  10      20)
     (a-index above  16      30)
     (bz      below -2.0    -8.0)
+    (sunspots below  15      10)
     (flux    below  90      70))
   "When a reading counts as degraded or as severe.
 
@@ -1140,6 +1215,10 @@ that an unscaled reading simply renders without colour."
                 ((>= value warn) 'warn)
                 (t 'good)))))))
 
+(make-obsolete-variable 'ham-spacewx-signed-metrics
+                        "set :scale symmetric in `ham-spacewx-metric-scales'."
+                        "0.13.1")
+
 (defcustom ham-spacewx-signed-metrics '(bz)
   "Metrics whose sign carries the meaning, not just their magnitude.
 
@@ -1163,6 +1242,27 @@ always zero and a crossing is visible as a crossing."
     ('protons 'protons)
     ('flux 'flux)
     ('sunspots 'sunspots)))
+
+(defconst ham-spacewx--metrics
+  '(speed density bz bt kp a-index xray xray-max protons flux sunspots)
+  "Every metric the panel draws.")
+
+(defun ham-spacewx-source-metrics (key)
+  "Return the metrics read from the source stored under KEY."
+  (seq-filter (lambda (metric) (eq (ham-spacewx-metric-source metric) key))
+              ham-spacewx--metrics))
+
+(defun ham-spacewx--readable-p (key)
+  "Return non-nil if any metric can be read from the payload under KEY.
+
+A feed can arrive intact and still be unreadable: the GOES X-ray and
+proton feeds are narrowed to one energy channel before anything is read
+from them, and a channel named in a spelling this package does not
+recognise leaves a full payload with nothing in it.  That failure has
+no error attached to it, so without asking this question the panel
+draws a dash and says nothing about why."
+  (seq-some (lambda (metric) (ham-spacewx-metric-series metric))
+            (ham-spacewx-source-metrics key)))
 
 (defun ham-spacewx-metric-view (metric)
   "Return the drawing plan for METRIC as a plist."
@@ -1580,7 +1680,7 @@ expectations, not to be measured against."
              (minutes (/ seconds 60.0)))
         (cond
          ((< minutes 1) nil)
-         ((< minutes 60) (format "%d min" (round minutes)))
+         ((< minutes 60) (format "%d m" (round minutes)))
          ((< minutes 2880) (format "%d h" (round (/ minutes 60))))
          (t (format "%d d" (round (/ minutes 1440)))))))))
 
@@ -1596,25 +1696,120 @@ expectations, not to be measured against."
   "Return the character ramp to draw sparklines with."
   (if (ham-unicode-blocks-p) ham-spacewx--blocks ham-spacewx--ascii))
 
-(defun ham-spacewx--sparkline-bounds (series metric)
-  "Return the (LOW . HIGH) the ramp should span for SERIES under METRIC.
-A signed metric is scaled symmetrically about zero so the midpoint of
-the ramp always means zero.  Everything else spans its own range, which
-uses the full ramp for whatever variation is present."
-  (if (memq metric ham-spacewx-signed-metrics)
-      (let ((magnitude (apply #'max (mapcar #'abs series))))
-        (if (zerop magnitude) (cons -1.0 1.0) (cons (- magnitude) magnitude)))
-    (cons (apply #'min series) (apply #'max series))))
+(defcustom ham-spacewx-metric-scales
+  '((kp       :scale noaa   :min 0)
+    (xray-max :scale noaa   :min 1.0e-9 :interpolate log)
+    (protons  :scale noaa   :min 0.01   :interpolate log)
+    (xray     :scale log    :min 1.0e-9 :max 1.0e-3)
+    (a-index  :scale linear :min 0   :max 100)
+    (flux     :scale linear :min 60  :max 300)
+    (sunspots :scale linear :min 0   :max 250)
+    (speed    :scale linear :min 250 :max 800)
+    (density  :scale linear :min 0   :max 30)
+    (bt       :scale linear :min 0   :max 30)
+    (bz       :scale symmetric :max 20))
+  "The vertical scale each sparkline is drawn to.
+
+Without this every trace is stretched to its own highest and lowest
+sample, so the ramp says nothing absolute: a fortnight of dead quiet
+fills the same eight glyphs as a severe storm, and two refreshes an
+hour apart are drawn to different scales.
+
+Each entry is (METRIC . PLIST) accepting:
+  :scale  `linear' spans :min to :max.
+          `log' does the same in decades, which is the only way to draw
+          X-ray flux: A to X class is six orders of magnitude, and on a
+          linear ramp everything below the peak collapses onto the floor.
+          `symmetric' spans -:max to +:max, so the middle of the ramp is
+          zero and a Bz crossing reads as a crossing.
+          `noaa' maps the value onto its NOAA scale level, so the ramp
+          runs 0 to 5 and one glyph step is about one storm level.
+          Thresholds come from `ham-spacewx-noaa-scales', and
+          :interpolate says whether to space values between them
+          linearly or by decades.
+  :min    bottom of the scale; for `noaa', the value at level 0.
+  :max    top of the scale.
+
+A metric with no entry keeps the old behaviour and is stretched to its
+own range.  Values beyond a scale clamp to its end rather than
+rescaling everything, so one X20 flare does not flatten the month."
+  :type '(alist :key-type symbol :value-type plist)
+  :group 'ham-spacewx)
+
+(defun ham-spacewx--vertical-scale (metric)
+  "Return the drawing scale for METRIC, or nil to use its own range."
+  (cdr (assq metric ham-spacewx-metric-scales)))
+
+(defun ham-spacewx--clamp (fraction)
+  "Return FRACTION held within 0 and 1."
+  (max 0.0 (min 1.0 fraction)))
+
+(defun ham-spacewx--interpolate (low high value logp)
+  "Return where VALUE falls between LOW and HIGH as a fraction.
+With LOGP the spacing is by decades rather than by size."
+  (if logp
+      (let ((l (log (max (or low 1.0e-12) 1.0e-12)))
+            (h (log (max (or high 1.0e-12) 1.0e-12)))
+            (v (log (max value 1.0e-12))))
+        (if (= h l) 0.0 (/ (- v l) (- h l))))
+    (if (= high low) 0.0 (/ (float (- value low)) (- high low)))))
+
+(defun ham-spacewx--noaa-thresholds (metric)
+  "Return the NOAA thresholds METRIC is measured on, or nil."
+  (nth 3 (seq-find (lambda (e) (eq (nth 1 e) metric)) ham-spacewx-noaa-scales)))
+
+(defun ham-spacewx--noaa-letter (metric)
+  "Return the NOAA scale letter for METRIC, or nil."
+  (car (seq-find (lambda (e) (eq (nth 1 e) metric)) ham-spacewx-noaa-scales)))
+
+(defun ham-spacewx--noaa-level (metric value low logp)
+  "Return VALUE as a level from 0 to 5 on METRIC's NOAA scale.
+LOW is the value counting as the bottom of level 0.  Nil when METRIC
+has no NOAA scale."
+  (let ((th (ham-spacewx--noaa-thresholds metric)))
+    (when th
+      (cond
+       ((< value (nth 0 th))
+        (ham-spacewx--clamp
+         (ham-spacewx--interpolate (or low 0) (nth 0 th) value logp)))
+       ((>= value (nth 4 th)) 5.0)
+       (t (let ((level 1.0))
+            (dotimes (i 4)
+              (let ((lo (nth i th)) (hi (nth (1+ i) th)))
+                (when (and (>= value lo) (< value hi))
+                  (setq level (+ 1.0 i (ham-spacewx--interpolate lo hi value logp))))))
+            level))))))
+
+(defun ham-spacewx--auto-position (value series)
+  "Return where VALUE sits within SERIES's own range, as a fraction."
+  (let* ((low (apply #'min series))
+         (high (apply #'max series))
+         (span (- high low)))
+    (if (zerop span) 0.5 (ham-spacewx--clamp (/ (- value low) (float span))))))
+
+(defun ham-spacewx--sparkline-position (value metric series)
+  "Return where VALUE sits on the ramp for METRIC, as a fraction.
+SERIES is the trace being drawn, used only by a metric with no fixed
+scale of its own, which is stretched to its own range instead."
+  (let* ((plist (ham-spacewx--vertical-scale metric))
+         (low (plist-get plist :min))
+         (high (plist-get plist :max))
+         (logp (eq (plist-get plist :interpolate) 'log)))
+    (pcase (and plist (plist-get plist :scale))
+      ('noaa (let ((level (ham-spacewx--noaa-level metric value low logp)))
+               (if level (/ level 5.0) (ham-spacewx--auto-position value series))))
+      ('log (ham-spacewx--clamp (ham-spacewx--interpolate low high value t)))
+      ('symmetric (ham-spacewx--clamp
+                   (/ (+ (/ value (float (or high 1.0))) 1.0) 2.0)))
+      ('linear (ham-spacewx--clamp (ham-spacewx--interpolate low high value nil)))
+      (_ (ham-spacewx--auto-position value series)))))
 
 (defun ham-spacewx-sparkline (values &optional width metric)
   "Return VALUES drawn as a sparkline string of WIDTH characters.
 WIDTH defaults to `ham-spacewx-series-length'.  Only the last WIDTH
-values are drawn.  When METRIC is given, each sample is coloured by its
-own severity, so the moment a storm developed is visible in the trace
-rather than only in the current value, and a metric listed in
-`ham-spacewx-signed-metrics' is scaled about zero.  Returns an empty
-string for an empty series, and a flat line when every value is the
-same, rather than dividing by zero."
+values are drawn.  When METRIC is given each sample is coloured by its
+own severity, and the trace is drawn to that metric's entry in
+`ham-spacewx-metric-scales'."
   (let* ((numbers (ham-spacewx--numbers values))
          (width (or width ham-spacewx-series-length))
          (series (ham-spacewx--tail numbers width))
@@ -1622,41 +1817,35 @@ same, rather than dividing by zero."
          (steps (1- (length ramp))))
     (if (null series)
         ""
-      (let* ((bounds (ham-spacewx--sparkline-bounds series metric))
-             (low (car bounds))
-             (span (- (cdr bounds) low)))
-        (mapconcat
-         (lambda (value)
-           (let ((glyph (aref ramp (if (zerop span)
-                                       (/ steps 2)
-                                     (min steps
-                                          (max 0 (round (* steps (/ (- value low)
-                                                                    (float span)))))))))
-                 (face (and metric (ham-spacewx--face-for metric value))))
-             (if face (propertize glyph 'face face) glyph)))
-         series "")))))
+      (mapconcat
+       (lambda (value)
+         (let ((glyph (aref ramp (round (* steps (ham-spacewx--sparkline-position
+                                                  value metric series)))))
+               (face (and metric (ham-spacewx--face-for metric value))))
+           (if face (propertize glyph 'face face) glyph)))
+       series ""))))
 
 (defun ham-spacewx--scale-note (series metric)
-  "Return a note describing the vertical scale of SERIES, or nil.
+  "Return a note naming the vertical scale SERIES is drawn to, or nil.
+METRIC supplies that scale.
 
-A signed METRIC reports the half height, since its midpoint is zero and
-what matters is how far either way the trace reaches.  Everything else
-reports the range the ramp spans, which is what says whether a dramatic
-looking trace is a real excursion or a flat reading magnified.
-
-SERIES must already be trimmed to the window being drawn, or the note
-describes a range that is not on screen."
-  (let ((numbers (ham-spacewx--numbers series)))
-    (when (cdr numbers)
-      (let ((low (apply #'min numbers))
-            (high (apply #'max numbers)))
-        (cond
-         ((memq metric ham-spacewx-signed-metrics)
-          (let ((magnitude (max (abs low) (abs high))))
-            (and (> magnitude 0)
-                 (format "±%s" (ham-spacewx--format-number magnitude)))))
-         ((= low high) nil)
-         (t (ham-spacewx--format-range low high metric)))))))
+With a fixed scale the note is the same every refresh, which is the
+point: it says what the ramp spans, so a trace can be read without
+comparing it to the last time it was looked at."
+  (let* ((plist (ham-spacewx--vertical-scale metric))
+         (kind (and plist (plist-get plist :scale)))
+         (low (plist-get plist :min))
+         (high (plist-get plist :max)))
+    (pcase kind
+      ('noaa (let ((letter (ham-spacewx--noaa-letter metric)))
+               (and letter (format "%s0\u2013%s5" letter letter))))
+      ('symmetric (and high (format "\u00b1%s" (ham-spacewx--format-number high))))
+      ((or 'linear 'log)
+       (and low high (ham-spacewx--format-range low high metric)))
+      (_ (let ((numbers (ham-spacewx--numbers series)))
+           (when (cdr numbers)
+             (let ((lo (apply #'min numbers)) (hi (apply #'max numbers)))
+               (unless (= lo hi) (ham-spacewx--format-range lo hi metric)))))))))
 
 (defun ham-spacewx--format-number (value)
   "Return VALUE with one decimal, dropping a trailing zero."
@@ -1672,8 +1861,8 @@ Otherwise the precision follows the magnitude, and both ends are given
 the same precision so the pair reads as a range rather than as two
 unrelated numbers."
   (if (eq (ham-spacewx-metric-scale metric) 'R)
-      (format "%s–%s" (or (ham-spacewx-xray-class low) "?")
-              (or (ham-spacewx-xray-class high) "?"))
+      (format "%s–%s" (or (ham-spacewx-xray-class low 0) "?")
+              (or (ham-spacewx-xray-class high 0) "?"))
     (let* ((magnitude (max (abs low) (abs high)))
            (decimals (cond
                       ((and (= low (truncate low)) (= high (truncate high))) 0)
@@ -1713,10 +1902,6 @@ empty panel tells the operator nothing at all."
                        :error error
                        :failed (and error (current-time)))
              ham-spacewx--data))
-  (if error
-      (ham-log "ham-spacewx: %s failed: %s%s" key error
-               (if (ham-spacewx--payload key) " (keeping last reading)" ""))
-    (ham-log "ham-spacewx: %s updated" key))
   (when error (ham-spacewx--schedule-retry key))
   ;; Redraw once the whole refresh has landed rather than after each
   ;; feed.  Redrawing per source rebuilds the panel five times, and the
@@ -1743,7 +1928,6 @@ succeeds, and turns a panel full of errors into an ordinary refresh."
       (lambda ()
        (let ((source (ham-spacewx-source key)))
           (when (and source (not (memq key ham-spacewx--in-flight)))
-            (ham-log "ham-spacewx: retrying %s" key)
             (ham-spacewx--fetch source))))))))
 
 (defun ham-spacewx--body ()
@@ -1885,8 +2069,6 @@ block, which is why it is not the first choice."
         (curl (ham-spacewx--curl)))
     (push key ham-spacewx--in-flight)
     (setq ham-spacewx--retried (delq key ham-spacewx--retried))
-    (ham-log "ham-spacewx: fetching %s from %s via %s"
-             key url (if curl "curl" "url.el"))
     (condition-case err
         (if curl
             (ham-spacewx--fetch-with-curl curl key url shape seconds)
@@ -1905,66 +2087,157 @@ With a prefix argument, or non-nil FORCE, read every source regardless."
   (unless ham-spacewx--in-flight
     (ham-spacewx--redisplay)))
 
-;;;###autoload
-(defun ham-spacewx-diagnose ()
-  "Re-read every feed and report exactly what each one answered.
-Writes the address, the outcome and, where a feed parsed, the shape of
-what came back.  This is the first thing to run when the panel shows no
-readings: it distinguishes a moved endpoint from a network problem from
-a payload this package does not understand."
-  (interactive)
-  (let ((buffer (get-buffer-create "*ham-spacewx-diagnose*")))
+(defun ham-spacewx--diagnose-deadline ()
+  "Return when to stop waiting for a diagnostic refresh to finish.
+The longest any feed is allowed to take, plus a margin for a machine
+that is starting several transfers at once."
+  (+ (float-time) 5
+     (apply #'max (mapcar #'ham-spacewx-source-seconds ham-spacewx--sources))))
+
+(defun ham-spacewx--diagnose-render (buffer)
+  "Write the current state of every feed into BUFFER."
+  (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (let ((inhibit-read-only t))
+      (let ((inhibit-read-only t)
+            (line (line-number-at-pos)))
         (erase-buffer)
-        (special-mode)
         (insert "ham-spacewx diagnostics\n")
         (insert (format "Emacs %s, system-type %s\n" emacs-version system-type))
         (insert (format "Fetching via %s\n"
                         (if (ham-spacewx--curl) "curl" "url.el")))
         (insert "(windows-nt is Emacs's name for every modern Windows,\n")
         (insert " not a version number)\n\n")
-        (insert "Refreshing every feed.  Run this again in a few seconds\n")
-        (insert "if any source still reads \"fetching\".\n\n")))
+        (insert (if ham-spacewx--in-flight
+                    (format "Waiting for %d of %d feeds.  This updates itself.\n\n"
+                            (length ham-spacewx--in-flight)
+                            (length ham-spacewx--sources))
+                  "Every feed has answered.\n\n"))
+        (dolist (source ham-spacewx--sources)
+          (let* ((key (ham-spacewx-source-key source))
+                 (payload (ham-spacewx--payload key))
+                 (err (ham-spacewx--error key)))
+            (insert (format "%s\n  %s\n"
+                            (ham-spacewx-source-label source)
+                            (ham-spacewx-source-url source)))
+            (insert
+             (cond
+              ((memq key ham-spacewx--in-flight) "  still fetching\n")
+              (err (format "  FAILED: %s\n" err))
+              ((null payload) "  parsed, but empty\n")
+              (t (concat
+                  (format "  ok, %d %s\n  %s: %s\n"
+                          (length payload)
+                          (if (ham-spacewx--table-p payload)
+                              "rows including the header"
+                            "records")
+                          (if (ham-spacewx--table-p payload)
+                              "columns" "fields")
+                          (mapconcat #'identity
+                                     (ham-spacewx--field-names payload)
+                                     ", "))
+                  (ham-spacewx--diagnose-channel key)
+                  (ham-spacewx--diagnose-readings key)))))
+            (insert "\n")))
+        (goto-char (point-min))
+        (forward-line (1- line))))))
+
+(defun ham-spacewx--diagnose-watch (buffer deadline)
+  "Redraw the report in BUFFER until every feed answers or DEADLINE passes.
+
+Waiting for the feeds rather than guessing how long they take.  The
+report used to be written two seconds after the refresh was started,
+which on a slow link, or a machine bringing up eight transfers at once,
+produced a page reading `still fetching' for everything -- a report
+that says nothing about the only question it was opened to answer."
+  (when (buffer-live-p buffer)
+    (ham-spacewx--diagnose-render buffer)
+    (if (and ham-spacewx--in-flight (< (float-time) deadline))
+        (ham-spacewx--remember-timer
+         (run-at-time 1 nil #'ham-spacewx--diagnose-watch buffer deadline))
+      (when ham-spacewx--in-flight
+        (with-current-buffer buffer
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert "Gave up waiting.  A feed still fetching here is one\n"
+                    "that never answered: check the address above in a\n"
+                    "browser, and check whether anything on this machine\n"
+                    "intercepts HTTPS.\n")))))))
+
+;;;###autoload
+(defun ham-spacewx-diagnose ()
+  "Re-read every feed and report exactly what each one answered.
+Writes the address, the outcome and, where a feed parsed, the shape of
+what came back.  This is the first thing to run when the panel shows no
+readings: it distinguishes a moved endpoint from a network problem from
+a payload this package does not understand.
+
+The report updates itself as the feeds land, so it can be watched
+rather than run twice."
+  (interactive)
+  (let ((buffer (get-buffer-create "*ham-spacewx-diagnose*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (special-mode)))
     (ham-spacewx-refresh t)
-    (run-at-time
-     2 nil
-     (lambda ()
-       (with-current-buffer buffer
-         (let ((inhibit-read-only t))
-           (goto-char (point-max))
-           (dolist (source ham-spacewx--sources)
-             (let* ((key (ham-spacewx-source-key source))
-                    (payload (ham-spacewx--payload key))
-                    (err (ham-spacewx--error key)))
-               (insert (format "%s\n  %s\n"
-                               (ham-spacewx-source-label source)
-                               (ham-spacewx-source-url source)))
-               (insert
-                (cond
-                 ((memq key ham-spacewx--in-flight) "  still fetching\n")
-                 (err (format "  FAILED: %s\n" err))
-                 ((null payload) "  parsed, but empty\n")
-                 (t (format "  ok, %d %s\n  %s: %s\n  reading: %s\n"
-                            (length payload)
-                            (if (ham-spacewx--table-p payload)
-                                "rows including the header"
-                              "records")
-                            (if (ham-spacewx--table-p payload)
-                                "columns" "fields")
-                            (mapconcat #'identity
-                                       (ham-spacewx--field-names payload) ", ")
-                            (or (ham-spacewx--number-string
-                                 (pcase key
-                                   ('wind (ham-spacewx-solar-wind-speed))
-                                   ('mag (ham-spacewx-bz))
-                                   ('kindex (ham-spacewx-kp))
-                                   ('xray (ham-spacewx-xray-flux))
-                                   ('flux (ham-spacewx-solar-flux)))
-                                 "%s")
-                                "NONE — no candidate field matched")))))
-               (insert "\n")))))))
+    (ham-spacewx--diagnose-watch buffer (ham-spacewx--diagnose-deadline))
     (pop-to-buffer buffer)))
+
+(defun ham-spacewx--diagnose-channel (key)
+  "Return how narrowing the feed under KEY went, or an empty string.
+
+The GOES feeds interleave energy channels and are filtered to one
+before anything is read.  When that filter matches nothing the payload
+is full and every reading from it is empty, which looks from the
+outside exactly like a field this package cannot find.  Naming the
+values the feed actually carries is what tells the two apart."
+  (let* ((narrowed (pcase key
+                     ((or 'xray 'xray-long) (ham-spacewx--xray-long-band-of key))
+                     ('protons (ham-spacewx--proton-channel))))
+         (usable (pcase key
+                   ((or 'xray 'xray-long) (ham-spacewx--xray-measurements key))
+                   ('protons narrowed)))
+         (values (pcase key
+                   ((or 'xray 'xray-long 'protons)
+                    (seq-uniq (delq nil (mapcar
+                                         (lambda (r)
+                                           (ham-spacewx--field r "energy"))
+                                         (ham-spacewx--payload key))))))))
+    (if (null values)
+        ""
+      (concat
+       (format "  energy values: %s\n" (string-join values ", "))
+       (format "  after narrowing: %d records%s\n"
+               (length narrowed)
+               (if narrowed ""
+                 " — NOTHING MATCHED, so every reading here is empty"))
+       ;; The two filters fail for different reasons and want different
+       ;; answers, so the report counts them separately.
+       (if (= (length usable) (length narrowed))
+           ""
+         (format "  carrying a measurement: %d records%s\n"
+                 (length usable)
+                 (if usable ""
+                   " — every flux is zero, so GOES is not measuring")))))))
+
+(defun ham-spacewx--diagnose-readings (key)
+  "Return the current value of every metric read from the feed under KEY."
+  (let ((metrics (ham-spacewx-source-metrics key)))
+    (if (null metrics)
+        "  reading: nothing reads from this feed\n"
+      (mapconcat
+       (lambda (metric)
+         (let ((value (ham-spacewx--latest (ham-spacewx-metric-series metric))))
+           (format "  %s: %s\n" metric
+                   (cond
+                    (value (ham-spacewx--number-string value "%s"))
+                    ;; Only blame the field lookup when nothing else
+                    ;; explains the silence.  Saying no field matched
+                    ;; directly under a line reporting that every value
+                    ;; was zero sends the reader after the wrong bug.
+                    ((ham-spacewx--empty-feed-reason key))
+                    (t "NONE — no candidate field matched")))))
+       metrics ""))))
 
 
 ;;;; Rendering
@@ -1974,20 +2247,24 @@ a payload this package does not understand."
 ;; column below is derived from that width, and anything that will not
 ;; fit is truncated rather than allowed to run past it.
 ;;
-;;   col  1  2   indent
-;;        3 20   label
-;;       21 27   number, right aligned so the digits line up
-;;       28      gap
-;;       29 33   unit, left aligned so the units line up
-;;       34      gap
-;;       35 50   note, describing the reading in words
+;; A reading takes two lines.  The first names it and says, in one
+;; parenthesis, everything constant about it: its unit, how long its
+;; trace covers, and the scale that trace is drawn to.  The second draws
+;; the trace and puts the number itself at the end of it.
 ;;
-;; and beneath it, for a reading with a trend:
+;;   col  1  2   indent
+;;        3 ..   label, and its unit and scale in parentheses
 ;;
 ;;   col  1  4   indent
 ;;        5 32   sparkline
 ;;       33 34   gap
-;;       35 50   annotation, describing the trace's span and scale
+;;       35 50   the reading, and the words describing it
+;;
+;; The number sits against the right hand end of its own trace, which is
+;; where the eye already is: the trace says what has been happening and
+;; the number finishes the sentence with what is happening now.  A
+;; reading with no trace to draw puts its number in the same column, on
+;; the line with its label.
 
 (defcustom ham-spacewx-panel-width 50
   "Width in columns the panel lays itself out to.
@@ -1998,24 +2275,23 @@ one that is merely terse."
   :type 'integer
   :group 'ham-spacewx)
 
-(defconst ham-spacewx--label-width 18
-  "Column width for reading labels.")
-
-(defconst ham-spacewx--number-width 7
-  "Column width for the number itself, which is right aligned.
-Right aligning the digits is what lets a column of readings be scanned
-down rather than read across.")
-
-(defconst ham-spacewx--unit-width 5
-  "Column width for the unit following a number, which is left aligned.")
-
 (defconst ham-spacewx--sparkline-indent 4
   "Indent of the sparkline line beneath its reading.")
 
-(defun ham-spacewx--reading-width ()
-  "Return the column the words after a reading start at."
-  (+ 2 ham-spacewx--label-width ham-spacewx--number-width 1
-     ham-spacewx--unit-width 1))
+(defun ham-spacewx--reading-column ()
+  "Return the column, counting from zero, that readings start at.
+
+Just past the end of a sparkline, so every number in the panel lines up
+on the right hand end of its own trace."
+  (+ ham-spacewx--sparkline-indent ham-spacewx-series-length 2))
+
+(defun ham-spacewx--reading-room ()
+  "Return the columns available to a reading and the words after it."
+  (- ham-spacewx-panel-width (ham-spacewx--reading-column)))
+
+(defun ham-spacewx--pad-to (column)
+  "Insert spaces up to COLUMN, or two if already at or past it."
+  (insert (make-string (max 2 (- column (current-column))) ?\s)))
 
 (defun ham-spacewx--fit (text width)
   "Return TEXT cut to WIDTH columns, keeping any faces on it.
@@ -2049,24 +2325,59 @@ failed, which is written by the far end rather than by this package."
   "Insert TEXT as a section heading."
   (insert "\n" (propertize text 'face 'ham-spacewx-heading) "\n"))
 
-(defun ham-spacewx--row (label number &optional unit note metric reading)
-  "Insert one reading, and its trend beneath it.
+(defun ham-spacewx--row-heading (label unit metric series drawn)
+  "Return LABEL with everything constant about it in one parenthesis.
 
-LABEL names the reading.  NUMBER is its formatted value with no unit on
-it, so that the digits of every reading can be aligned on one column
-and the units on another.  UNIT is that unit.  NOTE is an optional
-plain description of what the value means, which sits beside it.
+UNIT is what the reading is measured in.  METRIC, SERIES and DRAWN
+supply how long the trace covers and the scale it is drawn to, or the
+age of the feed when it has stopped being current.
+
+These belong together and away from the number.  A unit and a scale do
+not change between refreshes; the number does.  Keeping the two apart
+means the eye returning to the panel lands on what moved."
+  (let* ((span (and drawn (ham-spacewx--span-label (cdr drawn))))
+         (age (and metric (ham-spacewx--metric-age metric)))
+         (detail (if age
+                     (format "%s old" (ham-spacewx--duration-label age))
+                   (and series (ham-spacewx--scale-note series metric))))
+         (parts (delq nil (list unit span detail))))
+    (if parts
+        (concat (propertize label 'face 'ham-spacewx-label)
+                (propertize (format " (%s)" (string-join parts ", "))
+                            ;; An age is the exception: a reading that
+                            ;; has stopped being current should not be
+                            ;; as quiet as one that is.
+                            'face (if age 'ham-spacewx-stale
+                                    'ham-spacewx-note)))
+      (propertize label 'face 'ham-spacewx-label))))
+
+(defun ham-spacewx--row-value (number note face)
+  "Return NUMBER and its NOTE as one string in FACE, cut to the room for it."
+  (let* ((text (or number "—"))
+         (room (ham-spacewx--reading-room)))
+    (propertize
+     ;; No number, no description of it.  A row reading "— unknown"
+     ;; says the same thing twice, and the second time at more length.
+     (if (and number note (not (string-empty-p note)))
+         (concat text " "
+                 (ham-spacewx--fit note (- room (string-width text) 1)))
+       text)
+     'face face)))
+
+(defun ham-spacewx--row (label number &optional unit note metric reading face)
+  "Insert one reading: its name and scale, then its trace and its value.
+
+LABEL names the reading and UNIT is what it is measured in; the unit
+joins the parenthesis after the name rather than trailing the number,
+so the number stands alone in its column.  NUMBER is the formatted
+value and NOTE an optional description of what that value means.
 
 METRIC supplies the series, the window and the colours.  READING is the
 number behind NUMBER; the colour comes from it rather than from the
 sparkline, because the sparkline may be resampled and the last bucket's
 average is not the current reading.  When READING is omitted the last
-drawn sample stands in.
-
-The trend goes on the line beneath, and what describes the trend -- how
-long it covers, how far the ramp reaches -- goes with it rather than
-with the reading.  Words about the value stay by the value; words about
-the picture stay by the picture.
+drawn sample stands in.  FACE overrides that colour entirely, for a row
+whose number means something other than a severity.
 
 One colour covers the value, the note and every sample of the trace, so
 a reading and the words describing it never disagree."
@@ -2075,62 +2386,31 @@ a reading and the words describing it never disagree."
          (shown (if (and metric (null reading))
                     (ham-spacewx--latest series)
                   reading))
-         (face (or (and metric (ham-spacewx--face-for metric shown))
+         (face (or face
+                   (and metric (ham-spacewx--face-for metric shown))
                    'ham-spacewx-value))
-         (room (- ham-spacewx-panel-width (ham-spacewx--reading-width))))
-    (insert "  "
-            (propertize (ham-spacewx--fit (string-pad label
-                                                      ham-spacewx--label-width)
-                                          ham-spacewx--label-width)
-                        'face 'ham-spacewx-label)
-            (propertize (string-pad (or number "—")
-                                    ham-spacewx--number-width nil t)
-                        'face face)
-            " "
-            ;; No number, no unit.  "— pfu" reads as a measurement in
-            ;; particle flux units when what happened is that nothing
-            ;; was measured at all.
-            (propertize (string-pad (if number (or unit "") "")
-                                    ham-spacewx--unit-width)
-                        'face 'ham-spacewx-label))
-    (when (and note (not (string-empty-p note)))
-      (insert " " (propertize (ham-spacewx--fit note room) 'face face)))
-    (insert "\n")
-    (ham-spacewx--insert-trend series metric)))
-
-(defun ham-spacewx--insert-trend (series metric)
-  "Insert the sparkline for SERIES under METRIC, and what describes it.
-
-The annotation says how long the trace covers and how far its ramp
-reaches, and -- when the feed behind it has aged out -- how old the
-reading is.  Age displaces the vertical range rather than joining it:
-in the space available, knowing a number is three hours stale matters
-more than knowing what the trace's top and bottom were."
-  (when series
-    (let ((line (ham-spacewx-sparkline series
-                                       (ham-spacewx-metric-window metric)
-                                       metric)))
-      (unless (string-empty-p line)
-        (let* ((drawn (ham-spacewx-metric-drawn metric))
-               (span (ham-spacewx--span-label (cdr drawn)))
-               (age (ham-spacewx--metric-age metric))
-               (detail (if age
-                           (format "%s old" (ham-spacewx--duration-label age))
-                         (ham-spacewx--scale-note series metric)))
-               (annotation (string-join (delq nil (list span detail)) ", "))
-               (room (- ham-spacewx-panel-width
-                        ham-spacewx--sparkline-indent
-                        (string-width line) 2)))
-          (insert (make-string ham-spacewx--sparkline-indent ?\s))
-          (insert (if (get-text-property 0 'face line)
-                      line
-                    (propertize line 'face 'ham-spacewx-sparkline)))
-          (unless (or (string-empty-p annotation) (< room 4))
-            (insert "  " (propertize (ham-spacewx--fit annotation room)
-                                     'face (if age
-                                               'ham-spacewx-stale
-                                             'ham-spacewx-label))))
-          (insert "\n"))))))
+         (trace (and series
+                     (ham-spacewx-sparkline series
+                                            (ham-spacewx-metric-window metric)
+                                            metric)))
+         (value (ham-spacewx--row-value number note face)))
+    (insert "  " (ham-spacewx--fit
+                  (ham-spacewx--row-heading label unit metric series drawn)
+                  (- ham-spacewx-panel-width 2
+                     (if (and trace (not (string-empty-p trace)))
+                         0
+                       (+ 2 (string-width value))))))
+    (if (and trace (not (string-empty-p trace)))
+        (progn
+          (insert "\n" (make-string ham-spacewx--sparkline-indent ?\s))
+          (insert (if (get-text-property 0 'face trace)
+                      trace
+                    (propertize trace 'face 'ham-spacewx-sparkline))))
+      ;; Nothing to draw, so the number keeps its column on the name's
+      ;; own line rather than sitting alone under an empty one.
+      nil)
+    (ham-spacewx--pad-to (ham-spacewx--reading-column))
+    (insert value "\n")))
 
 (defun ham-spacewx--number-string (value format-string)
   "Return VALUE rendered with FORMAT-STRING, or nil if VALUE is nil."
@@ -2172,13 +2452,65 @@ cluttered with ages that all say the same thing."
                   (ham-spacewx--duration-label age))
         (format "unavailable: %s" (ham-spacewx--error key)))))
    ((null (ham-spacewx--fetched-at key)) "not fetched")
+   ;; Arrived, parsed, and still unreadable.  Worth saying plainly:
+   ;; every other state the panel reports is a failure to fetch, and an
+   ;; operator looking at a dash has no way to tell the two apart.
+   ((and (ham-spacewx--payload key) (not (ham-spacewx--readable-p key)))
+    (or (ham-spacewx--empty-feed-reason key)
+        "fetched, but no reading could be taken from it"))
    ((ham-spacewx--stale-p key)
     (format "stale, %s old" (ham-spacewx--duration-label
                              (ham-spacewx--age key))))))
 
+(defun ham-spacewx--grid-label (grid)
+  "Return GRID in the conventional Maidenhead case.
+
+Field letters upper case, square digits, subsquare letters lower case:
+CM98jr rather than cm98JR.  The locator is a setting an operator types
+by hand, and the panel should not read back what they typed in whatever
+case they happened to use."
+  (let ((g (string-trim grid)))
+    (apply #'concat
+           (seq-map-indexed
+            (lambda (chunk index)
+              (pcase index (0 (upcase chunk)) (2 (downcase chunk)) (_ chunk)))
+            (seq-partition g 2)))))
+
+(defun ham-spacewx--propagation-heading ()
+  "Return the heading for the propagation section.
+
+The locator is named rather than the estimate being labelled as one.
+Whose ionosphere this is matters more than the reminder that it is
+modelled, which the section says at length in the help."
+  (let ((grid (and ham-station-grid (ham-station-latlon) ham-station-grid)))
+    (if grid
+        (format "Propagation for grid %s" (ham-spacewx--grid-label grid))
+      "Propagation")))
+
+(defun ham-spacewx--empty-feed-reason (key)
+  "Return why the feed under KEY yields no reading, when that is known.
+
+Distinguishing an instrument that is not reporting from a feed this
+package cannot parse.  Both leave the row empty and they are not the
+same news: one is NOAA's to fix and will come back on its own, the
+other is a bug here."
+  (pcase key
+    ((or 'xray 'xray-long)
+     ;; Only claim the fluxes are zero when there are fluxes to be
+     ;; zero.  Records whose flux field this package cannot find are
+     ;; dropped by the same filter, and that is the other diagnosis
+     ;; entirely -- a bug here rather than an outage at NOAA.
+     (let ((fluxes (delq nil
+                         (mapcar (lambda (record)
+                                   (ham-spacewx--number
+                                    (ham-spacewx--field record "flux")))
+                                 (ham-spacewx--xray-long-band-of key)))))
+       (when (and fluxes (null (ham-spacewx--xray-measurements key)))
+         "no data: every flux reads zero, which is a gap and not a quiet sun")))))
+
 (defun ham-spacewx--render-propagation ()
   "Insert the propagation estimate, or say why there is none."
-  (ham-spacewx--heading "Propagation (estimated)")
+  (ham-spacewx--heading (ham-spacewx--propagation-heading))
   (cond
    ((null (ham-station-latlon))
     (let ((start (point)))
@@ -2196,9 +2528,12 @@ cluttered with ages that all say the same thing."
       ;; Now and twelve hours out are two readings, not one reading and
       ;; a parenthesis, so they align in the same column and can be
       ;; compared by looking straight down.
-      (ham-spacewx--row "MUF, 3000 km hop" (format "%.1f" muf) "MHz")
-      (ham-spacewx--row "MUF in 12 h" (format "%.1f" muf-night) "MHz")
-      (ham-spacewx--row "Absorption floor" (format "%.1f" luf) "MHz")
+      (ham-spacewx--row "MUF, 3000 km hop" (format "%.1f" muf) "MHz"
+                        nil nil nil 'ham-spacewx-estimate)
+      (ham-spacewx--row "MUF in 12 h" (format "%.1f" muf-night) "MHz"
+                        nil nil nil 'ham-spacewx-estimate)
+      (ham-spacewx--row "Absorption floor" (format "%.1f" luf) "MHz"
+                        nil nil nil 'ham-spacewx-estimate)
       ;; Day and night separately.  A single row for "now" hides the
       ;; thing an operator actually plans around: which bands will be
       ;; there this evening, and which will not.
@@ -2213,11 +2548,7 @@ cluttered with ages that all say the same thing."
          (mapcar (lambda (entry)
                    (cons (car entry) (ham-spacewx--condition-face (cdr entry))))
                  (ham-spacewx-band-conditions-at (cdr period)))))
-      (ham-spacewx--insert-legend
-       (mapcar (lambda (state)
-                 (cons (cdr state) (ham-spacewx--condition-face (car state))))
-               '((good . "good") (fair . "fair")
-                 (poor . "marginal") (closed . "closed"))))))))
+))))
 
 (defun ham-spacewx--insert-legend (entries)
   "Insert ENTRIES as a row of coloured words, wrapped to the panel width.
@@ -2324,7 +2655,7 @@ because every band in the list is a band somebody asked to see."
       (ham-spacewx--row "Sunspot number"
                         (ham-spacewx--number-string ssn "%.0f")
                         nil nil 'sunspots ssn))
-    (ham-spacewx--row "Proton >=10 MeV"
+    (ham-spacewx--row "Proton flux"
                       (ham-spacewx--compact-number protons)
                       "pfu" nil 'protons protons)))
 
@@ -2372,19 +2703,18 @@ beside it answers what it has been doing."
   (let ((inhibit-read-only t)
         (point (point)))
     (erase-buffer)
-    (insert (propertize "Space Weather" 'face 'ham-spacewx-heading))
     (let* ((ages (delq nil (mapcar (lambda (source)
                                      (ham-spacewx--age
                                       (ham-spacewx-source-key source)))
                                    ham-spacewx--sources)))
            (oldest (and ages (seq-max ages))))
-      (insert (propertize
-               (format "   NOAA SWPC%s\n"
+      (insert (ham-panel-header
+               (format "Space Weather   NOAA SWPC%s"
                        (if (and oldest (>= oldest 60))
-                           (format ", oldest %s"
+                           (format "   oldest reading %s"
                                    (ham-spacewx--duration-label oldest))
                          ""))
-               'face 'ham-spacewx-label)))
+               "? keys   g refresh   G all   c clear   q bury")))
     (ham-spacewx--render-scales)
     ;; Propagation first.  It is the question the rest of the panel is
     ;; evidence for, and an operator who reads one section reads this
@@ -2473,11 +2803,10 @@ been killed stops the timer rather than leaving it running."
     (cond
      ((not (buffer-live-p (get-buffer ham-spacewx-buffer-name)))
       (ham-spacewx--stop-timer))
-     (ham-spacewx--in-flight
-      (ham-log "ham-spacewx: refresh still running, skipping this tick"))
+     ;; A refresh already running is left to finish: starting a second
+     ;; would double every request and settle no sooner.
+     (ham-spacewx--in-flight nil)
      ((ham-spacewx--slept-p gap)
-      (ham-log "ham-spacewx: %.0fs gap suggests resume, waiting %ss"
-               gap ham-spacewx-wake-delay)
       (ham-spacewx--redisplay)
       (ham-spacewx--remember-timer
        (run-at-time ham-spacewx-wake-delay nil #'ham-spacewx--wake)))
@@ -2503,7 +2832,8 @@ been killed stops the timer rather than leaving it running."
   "G" #'ham-spacewx-refresh-all
   "c" #'ham-spacewx-clear
   "w" #'ham-spacewx-show-wind-sample
-  "?" #'ham-spacewx-help)
+  "?" #'ham-spacewx-help
+  "q" #'quit-window)
 
 (easy-menu-define ham-spacewx-mode-menu ham-spacewx-mode-map
   "Menu for `ham-spacewx-mode'."
@@ -2525,7 +2855,7 @@ been killed stops the timer rather than leaving it running."
     ["Customize" (lambda () (interactive) (customize-group 'ham-spacewx))
      :help "Endpoints, windows, thresholds and colours"]
     "---"
-    ["Bury panel" quit-window]))
+    ["Bury panel" quit-window :keys "q"]))
 
 (define-derived-mode ham-spacewx-mode special-mode "Space Wx"
   "Major mode for the space weather panel.
@@ -2545,14 +2875,38 @@ been killed stops the timer rather than leaving it running."
     (princ "  G    refresh every source now\n")
     (princ "  c    discard stored readings\n")
     (princ "  w    show the exact solar wind record in use\n")
+    (princ "  ?    show this help\n")
     (princ "  q    bury the panel\n\n")
+    (princ "Band conditions\n")
+    (with-current-buffer standard-output
+      ;; Shown in their own colours: a legend that names a colour without
+      ;; showing it explains nothing.
+      (dolist (entry '(("good"     good   "Open, the path well inside the MUF")
+                       ("fair"     fair   "Usable, below the MUF with less margin")
+                       ("marginal" poor   "Near the MUF, or into D layer absorption")
+                       ("closed"   closed "Above the MUF or below the absorption floor")))
+        (insert (format "  %s %s\n"
+                        (propertize (format "%-10s" (nth 0 entry))
+                                    'face (ham-spacewx--condition-face (nth 1 entry)))
+                        (nth 2 entry)))))
+    (princ "\n")
+    (princ "Sparkline scales\n")
+    (princ "  Traces are drawn to a fixed scale, named after each one, so\n")
+    (princ "  a quiet week looks quiet and two refreshes can be compared.\n")
+    (princ "  Kp, X-ray peak and protons are drawn on their NOAA scales,\n")
+    (princ "  so G0-G5, R0-R5 and S0-S5 label the ramp and one glyph step\n")
+    (princ "  is about one storm level.  X-ray and protons are spaced by\n")
+    (princ "  decades.  Change any of it in ham-spacewx-metric-scales.\n\n")
     (princ "Reading the panel\n")
-    (princ "  Numbers line up on one column and units on the next,\n")
-    (princ "  so a section can be read straight down.\n")
-    (princ "  Words beside a reading describe that reading.  Words\n")
-    (princ "  after a sparkline describe the trace: how long it\n")
-    (princ "  covers, and how far its ramp reaches.  When a feed has\n")
-    (princ "  aged out, the age replaces the range there.\n")
+    (princ "  A reading takes two lines.  The first names it and\n")
+    (princ "  gives, in one parenthesis, everything about it that\n")
+    (princ "  does not change between refreshes: its unit, how long\n")
+    (princ "  its trace covers, and the scale that trace is drawn\n")
+    (princ "  to.  The second draws the trace and puts the number\n")
+    (princ "  at the end of it, so every value lines up on the\n")
+    (princ "  right hand end of its own sparkline.  When a feed has\n")
+    (princ "  aged out, its age replaces the scale in that\n")
+    (princ "  parenthesis.\n")
     (princ "  Values and sparkline samples are coloured by severity,\n")
     (princ "  so when a disturbance began is visible in the trace.\n")
     (princ "  Bz is drawn about zero: the middle of the ramp is zero,\n")

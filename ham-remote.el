@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "29.1") (ham "0.1.0") (ham-rig "0.1.3"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -352,7 +352,6 @@ Unverified; see `ham-remote-zita-receive-command'."
         (unless (executable-find program)
           (user-error "Cannot find %s.  Install the transport, or correct its command"
                       program))
-        (ham-log "ham-remote: %s: %s" direction (string-join command " "))
         (setf (ham-remote--stream-process stream)
               (make-process
                :name (format "ham-remote-%s" direction)
@@ -360,24 +359,21 @@ Unverified; see `ham-remote-zita-receive-command'."
                :noquery t
                :connection-type 'pipe
                ;; No buffer: the process talks to the sound card, and
-               ;; anything it prints is diagnostics that belong in the
-               ;; log rather than in a buffer that grows all session.
-               :filter (lambda (_process output)
-                         (dolist (line (split-string output "\n" t))
-                           (ham-log "ham-remote: %s: %s" direction line)))
+               ;; what it prints is chatter that would otherwise
+               ;; accumulate in a buffer for the length of the session.
+               :filter #'ignore
                :sentinel (lambda (process event)
                            (ham-remote--stream-sentinel direction process event))))
         (setf (ham-remote--stream-started-at stream) (float-time))
         (ham-remote--schedule-redisplay)))
     stream))
 
-(defun ham-remote--stream-sentinel (direction process event)
-  "Handle EVENT from PROCESS carrying DIRECTION."
+(defun ham-remote--stream-sentinel (direction process _event)
+  "Handle a state change of PROCESS carrying DIRECTION."
   (let ((stream (ham-remote--stream direction)))
     (when (and (eq process (ham-remote--stream-process stream))
                (not (process-live-p process)))
       (setf (ham-remote--stream-process stream) nil)
-      (ham-log "ham-remote: %s stopped: %s" direction (string-trim event))
       (ham-remote--schedule-redisplay)
       ;; Only restart what the operator still wants running.
       (when ham-remote--running
@@ -468,9 +464,8 @@ keying."
                  (with-demoted-errors "ham-remote: transmit failed: %S"
                    (funcall function)))))
 
-(defun ham-remote--on-ptt (keyed)
-  "React to the transmitter being KEYED or not."
-  (ham-log "ham-remote: transmitter %s" (if keyed "keyed" "unkeyed"))
+(defun ham-remote--on-ptt (_keyed)
+  "React to the transmitter being keyed or not."
   (ham-remote--schedule-redisplay))
 
 (defun ham-remote--subscribe ()
@@ -618,8 +613,7 @@ putting the radio somewhere else."
   "S" #'ham-remote-stop
   "r" #'ham-remote-restart
   "R" #'ham-remote-show-radio-end
-  "g" #'ham-remote--redisplay
-  "L" #'ham-show-log)
+  "g" #'ham-remote--redisplay)
 
 (define-derived-mode ham-remote-mode special-mode "Remote"
   "Major mode showing the state of the remote audio link."
