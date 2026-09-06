@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.3
+;; Version: 0.1.6
 ;; Package-Requires: ((emacs "29.1") (ham "0.1.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -149,6 +149,47 @@ timeout timer, which you should also enable."
   :type '(choice integer (const nil))
   :group 'ham-rig)
 
+(defcustom ham-rig-tx-timeout-max 600
+  "Absolute ceiling on the transmit watchdog, in seconds.
+
+No transmission is allowed to run longer than this, whatever duration a
+caller declares through `ham-rig-expect-transmission\='.  It is the
+backstop against a declared duration that is wrong or absurd."
+  :type '(choice integer (const nil))
+  :group 'ham-rig)
+
+(defcustom ham-rig-tx-watchdog-margin 1.25
+  "How much longer than a declared duration a transmission may run.
+Applied to the figure given to `ham-rig-expect-transmission\='."
+  :type 'number
+  :group 'ham-rig)
+
+(defcustom ham-rig-tx-watchdog-floor 10
+  "Shortest transmit watchdog in seconds, however brief the transmission.
+Keeps a very short declared duration from arming a watchdog that fires
+before the rig has finished switching."
+  :type 'number
+  :group 'ham-rig)
+
+(defcustom ham-rig-unkey-attempts 3
+  "How many times to command an unkey before giving up and warning.
+An unkey that is not confirmed is retried: a transmitter left keyed is
+the worst failure this package can produce."
+  :type 'integer
+  :group 'ham-rig)
+
+(defcustom ham-rig-unkey-retry-delay 1.0
+  "Seconds between an unkey and the reading that confirms it."
+  :type 'number
+  :group 'ham-rig)
+
+(defcustom ham-rig-atu-timeout 20
+  "Seconds an antenna tuner cycle is expected to take.
+The tuner transmits a carrier while it matches, so the cycle is bounded
+by the transmit watchdog like any other transmission."
+  :type 'number
+  :group 'ham-rig)
+
 (defcustom ham-rig-smeter-width 22
   "Width in characters of the signal strength bar."
   :type 'integer
@@ -225,34 +266,64 @@ extra requests several times a second is all a serial link has spare."
   :group 'ham-rig)
 
 (defcustom ham-rig-meter-zones
-  '(("SWR" (2.0 . ham-rig-meter-warn) (3.0 . ham-rig-meter-danger)))
+  '(("SWR" (2.0 . ham-rig-meter-warn) (3.0 . ham-rig-meter-danger))
+    ("ALC" (0.5 . ham-rig-meter-warn) (0.8 . ham-rig-meter-danger)))
   "Readings at which a meter changes colour, as (NAME (VALUE . FACE)...).
 
 The bar is drawn in the face of the highest reading it has passed, so
 SWR runs in the ordinary meter face to 2:1, amber from 2:1 to 3:1 and
-red beyond.  Values are in the units the meter reads in."
+red beyond.  Values are in the units the meter reads in.
+
+The ALC thresholds are a starting point, not a specification: Hamlib
+does not report where a radio\='s own ALC zone ends, and some ALC action
+on voice peaks is normal while a lot of it is distortion.  Compare the
+bar against the radio\='s ALC marking and move these to match."
   :type '(alist :key-type string
                 :value-type (alist :key-type number :value-type face))
   :group 'ham-rig)
 
 (defcustom ham-rig-meter-units
-  '(("COMP_METER" "dB" 25.0)
-    ("VD_METER" "V" 16.0)
-    ("ID_METER" "A" 25.0))
-  "Units to read a normalised meter in, as (NAME UNIT FULL-SCALE).
+  '(("COMP_METER" "dB")
+    ("VD_METER" "V")
+    ("ID_METER" "A")
+    ("RFPOWER_METER_WATTS" "W"))
+  "Units to label a meter with, as (NAME UNIT &optional SCALE).
 
-Hamlib reports several meters as a fraction of full scale without saying
-what full scale is.  Compression is the one that matters: the radio
-shows decibels, so the reading is multiplied by FULL-SCALE and labelled
-UNIT.
+The reading is taken to be in UNIT already, which is what a transceiver
+reports for supply voltage and drain current: an FTDX10 answers 13.25
+for VD_METER and 1.8 for ID_METER -- volts and amps, not fractions of
+anything.  Multiplying those by a full scale is how a sound 13.25 V
+became a nonsensical 212 V.
 
-FULL-SCALE is a property of the radio that Hamlib does not report, so
-the default is an estimate.  A transceiver whose compression meter ends
-somewhere other than 25 dB wants that number changed here; nothing else
-in this package needs to know about it."
+SCALE is a multiplier for the rare meter that genuinely does report a
+fraction, and defaults to 1.  Set it only if a reading is out by a
+constant factor against the radio\='s own display."
   :type '(alist :key-type string
                 :value-type (list (string :tag "Unit")
-                                  (number :tag "Full scale")))
+                                  (choice :tag "Scale"
+                                          (const :tag "None" nil)
+                                          number)))
+  :group 'ham-rig)
+
+(defcustom ham-rig-meter-ranges
+  '(("VD_METER" 0 15)
+    ("ID_METER" 0 25)
+    ("COMP_METER" 0 25))
+  "Ranges to draw a meter over, as (NAME MIN MAX).
+
+Hamlib declares a range for every level, but for some meters that range
+describes nothing: an FTDX10 declares VD_METER as 0 to 1 and then
+answers 13.25.  A bar drawn over the declared range sits at full scale
+whatever the radio is doing.  A range given here replaces it.
+
+Values are in the units the meter reads in.  Adjust them to suit the
+radio: the defaults suit a 12 V transceiver drawing up to 25 A, with a
+compression meter ending at 25 dB.  A bar that sits at one end whatever
+the radio is doing means the range here does not match what the rig
+reports, and is the thing to correct."
+  :type '(alist :key-type string
+                :value-type (list (number :tag "Minimum")
+                                  (number :tag "Maximum")))
   :group 'ham-rig)
 
 (defcustom ham-rig-meters-without-value '("ALC")
@@ -370,6 +441,13 @@ the rig, and only the words for them are local to a model."
   "Transmit power setting in watts, as converted by the rig.")
 (defvar ham-rig--tx-meter-cursor 0)
 (defvar ham-rig--tx-timer nil)
+(defvar ham-rig--tx-id 0
+  "Counter identifying the current transmission.
+A watchdog timer carries the value current when it was armed, so one
+that has already been dispatched cannot act on a later transmission.")
+(defvar ham-rig--expected-tx-duration nil
+  "Declared duration of the next transmission, as (SECONDS . DECLARED-AT).")
+(defvar ham-rig--unkey-timer nil)
 (defvar ham-rig--tx-started-at nil)
 (defvar ham-rig--unkey-on-reconnect nil)
 (defvar ham-rig--owed 0
@@ -488,9 +566,11 @@ in place of RPRT.  It exists for `\\chk_vfo', which rigctld answers
 without a trailing RPRT; without it that request would occupy the link
 until it timed out, delaying everything queued behind it."
   (let ((kind (or kind 'user)))
-    (if (and (eq kind 'poll)
-             (>= (length ham-rig--queue) ham-rig-max-queue))
-        (ham-log "ham-rig: dropped poll %s (queue full)" command)
+    ;; A poll arriving at a full queue is dropped: the next poll will
+    ;; ask the same question a moment later, and letting them pile up
+    ;; delays the user's own commands behind stale ones.
+    (unless (and (eq kind 'poll)
+                 (>= (length ham-rig--queue) ham-rig-max-queue))
       (setq ham-rig--queue
             (append ham-rig--queue
                     (list (ham-rig--request-create
@@ -498,14 +578,21 @@ until it timed out, delaying everything queued behind it."
                            :terminator terminator))))
       (ham-rig--pump))))
 
-(defun ham-rig--enqueue-urgent (command &optional callback)
+(defun ham-rig--enqueue-urgent (command &optional callback match)
   "Queue COMMAND ahead of everything else waiting, calling CALLBACK.
 
 Keying and unkeying go this way.  A dozen polls can be queued at any
 moment, and on a serial link that is most of a second between pressing
 the key and the transmitter coming up.  The request still goes through
 the queue, so replies stay matched to their requests; it simply does not
-wait its turn."
+wait its turn.
+
+MATCH, when given, supersedes queued requests as `ham-rig--supersede\='
+describes.  Keying passes it so that a burst of keypresses sends one
+command rather than one per press: seven presses of the key would
+otherwise key and unkey the rig seven times, hot-switching the transmit
+relay for a second on end."
+  (when match (ham-rig--supersede match))
   (setq ham-rig--queue
         (cons (ham-rig--request-create
                :command command :callback callback :kind 'user)
@@ -539,7 +626,6 @@ a frequency, or a mode."
   (when (and ham-rig--inflight
              (> (- (float-time) (ham-rig--request-sent-at ham-rig--inflight))
                 ham-rig-request-timeout))
-    (ham-log "ham-rig: timeout on %s" (ham-rig--request-command ham-rig--inflight))
     (cl-incf (plist-get ham-rig--stats :timeouts))
     (ham-rig--abandon-inflight)
     (ham-rig--pump)))
@@ -567,9 +653,7 @@ a frequency, or a mode."
         (when (> elapsed (plist-get ham-rig--stats :latency-max))
           (plist-put ham-rig--stats :latency-max elapsed)))
       (unless (zerop rc)
-        (cl-incf (plist-get ham-rig--stats :errors))
-        (ham-log "ham-rig: %s returned RPRT %d"
-                 (ham-rig--request-command req) rc))
+        (cl-incf (plist-get ham-rig--stats :errors)))
       (when (ham-rig--request-callback req)
         (with-demoted-errors "ham-rig: callback error: %S"
           (funcall (ham-rig--request-callback req)
@@ -599,7 +683,6 @@ the stream has caught up with us again."
         (progn
           (cl-decf ham-rig--owed)
           (cl-incf (plist-get ham-rig--stats :discarded))
-          (ham-log "ham-rig: discarded a late reply")
           (setq ham-rig--resp-lines nil))
       (ham-rig--complete (string-to-number (match-string 1 line)))))
    ((> ham-rig--owed 0) nil)
@@ -737,17 +820,68 @@ also carrying frequency and PTT."
 
 ;;;; Transmit safety
 
+(defconst ham-rig--declaration-life 5.0
+  "Seconds a declared transmission duration stays valid.
+A declaration that is never taken up -- because the tuner matched
+without transmitting, say -- must not still be waiting when the operator
+next picks up the microphone, where it would cut the transmission short.")
+
+(defun ham-rig-expect-transmission (seconds)
+  "Declare that the transmission about to start will last SECONDS.
+
+The transmit watchdog is then bounded by that figure rather than by the
+whole of `ham-rig-tx-timeout\=', so a transmission of known length gets a
+watchdog matched to it.  A three minute limit on a twenty second tuner
+cycle leaves the transmitter keyed for the difference if anything jams.
+
+The declaration lapses after a few seconds if no transmission follows,
+and applies to one transmission only."
+  (setq ham-rig--expected-tx-duration (cons seconds (float-time))))
+
+(defun ham-rig--tx-watchdog-budget ()
+  "Return the seconds this transmission may run for, or nil for no limit.
+Consume any duration declared by `ham-rig-expect-transmission\='."
+  (let ((declared ham-rig--expected-tx-duration))
+    (setq ham-rig--expected-tx-duration nil)
+    (when (and declared
+               (> (- (float-time) (cdr declared)) ham-rig--declaration-life))
+      (setq declared nil))
+    (cond
+     ;; A declared duration is honoured even where the standing timeout
+     ;; has been switched off: the caller has said how long this will
+     ;; take, and holding it to that is the stronger guarantee.
+     (declared
+      (let ((budget (max ham-rig-tx-watchdog-floor
+                         (* (car declared) ham-rig-tx-watchdog-margin))))
+        (if ham-rig-tx-timeout-max
+            (min ham-rig-tx-timeout-max budget)
+          budget)))
+     ((and ham-rig-tx-timeout (> ham-rig-tx-timeout 0))
+      (if ham-rig-tx-timeout-max
+          (min ham-rig-tx-timeout-max ham-rig-tx-timeout)
+        ham-rig-tx-timeout))
+     (t nil))))
+
 (defun ham-rig--start-tx-watchdog ()
-  "Arm the transmit timeout."
+  "Arm the transmit timeout for this transmission."
   (ham-rig--cancel-tx-watchdog)
   (setq ham-rig--tx-started-at (float-time))
-  (when (and ham-rig-tx-timeout (> ham-rig-tx-timeout 0))
-    (setq ham-rig--tx-timer
-          (run-at-time ham-rig-tx-timeout nil #'ham-rig-panic-unkey))))
+  (let ((budget (ham-rig--tx-watchdog-budget))
+        (id ham-rig--tx-id))
+    (when (and budget (> budget 0))
+      (setq ham-rig--tx-timer
+            (run-at-time
+             budget nil
+             (lambda ()
+               ;; A timer already dispatched when the transmission ended
+               ;; would otherwise unkey the next one.
+               (when (= id ham-rig--tx-id)
+                 (ham-rig-panic-unkey))))))))
 
 (defun ham-rig--cancel-tx-watchdog ()
-  "Disarm the transmit timeout."
+  "Disarm the transmit timeout and retire the current transmission id."
   (when ham-rig--tx-timer (cancel-timer ham-rig--tx-timer))
+  (cl-incf ham-rig--tx-id)
   (setq ham-rig--tx-timer nil ham-rig--tx-started-at nil))
 
 ;;;###autoload
@@ -767,7 +901,8 @@ also carrying frequency and PTT."
         (ham-rig--abandon-inflight)
         (when (ham-connection-send ham-rig--connection "+T 0")
           (cl-incf ham-rig--owed))
-        (message "ham-rig: unkeyed"))
+        (ham-rig--verify-unkey 1)
+        (message "ham-rig: unkeying"))
     (setq ham-rig--unkey-on-reconnect t)
     (display-warning
      'ham-rig
@@ -776,6 +911,52 @@ unkey it at the front panel now. Enable the transceiver's own TX
 timeout timer so that a lost control link cannot hold the rig in
 transmit."
      :emergency)))
+
+(defun ham-rig--cancel-unkey-verification ()
+  "Stop any unkey confirmation in progress."
+  (when ham-rig--unkey-timer (cancel-timer ham-rig--unkey-timer))
+  (setq ham-rig--unkey-timer nil))
+
+(defun ham-rig--verify-unkey (attempt)
+  "Read PTT back after an unkey, and command it again if still keyed.
+
+ATTEMPT counts from one.  Commanding an unkey is not the same as the rig
+having stopped transmitting: the command can be lost, refused, or
+arrive while the rig is busy.  Up to `ham-rig-unkey-attempts\=' are made,
+and if the rig still reports itself keyed after that the operator is
+told, because at that point only the front panel will fix it."
+  (ham-rig--cancel-unkey-verification)
+  (setq ham-rig--unkey-timer
+        (run-at-time
+         ham-rig-unkey-retry-delay nil
+         (lambda ()
+           (setq ham-rig--unkey-timer nil)
+           (if (not (ham-rig-connected-p))
+               (setq ham-rig--unkey-on-reconnect t)
+             (ham-rig--enqueue-urgent
+              "t"
+              (lambda (r)
+                (let* ((v (ham-rig--labelled-val r "PTT"))
+                       (keyed (and v (not (equal v "0")))))
+                  (cond
+                   ;; A rig that cannot report PTT gives nothing to
+                   ;; verify against, so stop rather than warn every
+                   ;; time on such a rig.
+                   ((not (zerop (ham-rig-response-rc r))) nil)
+                   ((not keyed)
+                    (ham-rig--set 'ptt nil)
+                    (message "ham-rig: unkeyed"))
+                   ((< attempt ham-rig-unkey-attempts)
+                    (ham-rig--enqueue-urgent "T 0")
+                    (ham-rig--verify-unkey (1+ attempt)))
+                   (t
+                    (ham-rig--set 'ptt t)
+                    (display-warning
+                     'ham-rig
+                     (format "The rig still reports itself transmitting after %d
+attempts to unkey it. Unkey it at the front panel now."
+                             ham-rig-unkey-attempts)
+                     :emergency)))))))))))
 
 (defun ham-rig--kill-emacs-unkey ()
   "Unkey on exit.  Blocking briefly here is the correct trade."
@@ -850,8 +1031,7 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
      ;; The controls panel cannot know what to show until the rig has
      ;; described itself, so fill it as soon as it has.
      (when (and (ham-rig--controls-visible-p) (ham-rig-connected-p))
-       (ham-rig-controls-refresh))
-     (ham-log "ham-rig: model %s" (or (ham-rig--val r "Model name") "unknown")))))
+       (ham-rig-controls-refresh)))))
 
 ;;;###autoload
 (defun ham-rig-connect ()
@@ -873,6 +1053,7 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
   (ham-rig--stop-timers)
   (ham-rig--stop-countdown)
   (ham-rig--cancel-tx-watchdog)
+  (ham-rig--cancel-unkey-verification)
   (when ham-rig--connection (ham-connection-close ham-rig--connection))
   (setq ham-rig--connection nil ham-rig--queue nil ham-rig--inflight nil
         ham-rig--owed 0)
@@ -894,24 +1075,28 @@ Interactively, prompt.  Accepts 14074, 14.074 or 14.074.000."
                           (when-let ((f (ham-rig--num r "Frequency")))
                             (ham-rig--set 'frequency (round f))))))
 
-(defun ham-rig--enqueue-latest (match command &optional callback)
-  "Queue COMMAND, first dropping any queued request that MATCH supersedes.
+(defun ham-rig--supersede (match)
+  "Drop queued requests that MATCH supersedes.
 
 A queued request is superseded when its command is MATCH exactly, or
 begins with MATCH followed by a space.  Requiring that space matters:
 plain prefix matching would let \"l RFPOWER\" also discard a queued
-\"l RFPOWER_METER\", which is a different reading entirely.
-
-Adjusting a control generates a request per keypress and only the last
-one matters.  A held-down key would otherwise pile up hundreds of sets
-that the link has to work through long after the operator stopped."
+\"l RFPOWER_METER\", which is a different reading entirely."
   (let ((space (concat match " ")))
     (setq ham-rig--queue
           (cl-remove-if (lambda (request)
                           (let ((queued (ham-rig--request-command request)))
                             (or (equal queued match)
                                 (string-prefix-p space queued))))
-                        ham-rig--queue)))
+                        ham-rig--queue))))
+
+(defun ham-rig--enqueue-latest (match command &optional callback)
+  "Queue COMMAND, first dropping any queued request that MATCH supersedes.
+
+Adjusting a control generates a request per keypress and only the last
+one matters.  A held-down key would otherwise pile up hundreds of sets
+that the link has to work through long after the operator stopped."
+  (ham-rig--supersede match)
   (ham-rig--enqueue command callback))
 
 (defun ham-rig-tuning-step ()
@@ -1062,6 +1247,7 @@ while it matches, so it is refused unless the rig reports the operation."
     (user-error "Not connected to rigctld"))
   (unless (member "TUNE" (ham-rig--vfo-ops))
     (user-error "This rig reports no tuning cycle"))
+  (ham-rig-expect-transmission ham-rig-atu-timeout)
   (ham-rig--enqueue "G TUNE")
   (message "ham-rig: tuning cycle started; the rig will transmit"))
 
@@ -1120,10 +1306,10 @@ rig still listens while off, and at the radio if it does not."
   "Key or unkey the transmitter."
   (interactive)
   (if (ham-rig-ptt-p)
-      (progn (ham-rig--enqueue-urgent "T 0") (ham-rig--set 'ptt nil))
+      (progn (ham-rig--enqueue-urgent "T 0" nil "T") (ham-rig--set 'ptt nil))
     (unless (ham-rig-connected-p)
       (user-error "Not connected to rigctld"))
-    (ham-rig--enqueue-urgent "T 1")
+    (ham-rig--enqueue-urgent "T 1" nil "T")
     (ham-rig--set 'ptt t)))
 
 (defun ham-rig-refresh ()
@@ -1219,13 +1405,29 @@ shorted feedline at the right end."
     (if (ham-rig--control-swr-p control)
         (let ((swr (max 1.0 value)))
           (/ (- swr 1.0) (+ swr 1.0)))
-      (let* ((min (ham-rig--control-min control))
-             (span (- (ham-rig--control-max control) min)))
-        (and (> span 0) (/ (- value min) (float span)))))))
+      (let* ((range (ham-rig--meter-range control))
+             (min (car range))
+             (span (- (cadr range) min)))
+        (and (> span 0)
+             (max 0.0 (min 1.0 (/ (- value min) (float span)))))))))
+
+(defun ham-rig--meter-range (control)
+  "Return (MIN MAX) to draw CONTROL over.
+
+`ham-rig-meter-ranges' wins over the range the rig declares, because for
+some meters the declared range describes nothing that the readings
+respect."
+  (or (cdr (assoc (ham-rig--control-name control) ham-rig-meter-ranges))
+      (list (ham-rig--control-min control) (ham-rig--control-max control))))
 
 (defun ham-rig--control-swr-p (control)
   "Return non-nil if CONTROL is the standing wave ratio meter."
   (equal (ham-rig--control-name control) "SWR"))
+
+(defun ham-rig--format-reading (value)
+  "Return VALUE to one decimal place, dropping a trailing zero."
+  (let ((text (format "%.1f" value)))
+    (if (string-suffix-p ".0" text) (substring text 0 -2) text)))
 
 (defun ham-rig--format-meter (control value)
   "Return VALUE as the reading beside CONTROL's bar, which may be nothing.
@@ -1236,12 +1438,9 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
      ((member name ham-rig-meters-without-value) "")
      ((null value) "--")
      (unit
-      ;; Hamlib reports a fraction of full scale; the radio shows a
-      ;; number, so scale it back up.
-      (let* ((min (ham-rig--control-min control))
-             (span (- (ham-rig--control-max control) min))
-             (fraction (if (> span 0) (/ (- value min) (float span)) 0)))
-        (format "%d %s" (round (* fraction (nth 2 unit))) (nth 1 unit))))
+      (format "%s %s"
+              (ham-rig--format-reading (* value (or (nth 2 unit) 1)))
+              (nth 1 unit)))
      (t (ham-rig--format-level control value)))))
 
 (defun ham-rig--meter-zones (control)
@@ -1273,12 +1472,18 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
 (defun ham-rig--status-line ()
   "Return the one line describing the radio link.
 
-Word for word and colour for colour the line the QSO logger shows at
-the top of its form, so one connection reads the same way in either
-buffer."
+Opens with the radio the panel is talking to, the way the controls
+panel does, so both buffers name the same rig in the same place.  Until
+the rig has described itself there is no model to name, and the line
+falls back to what the panel is.
+
+It carries no frequency or mode.  Both are drawn in full a line below,
+and a reading shown twice in one small buffer is not reassurance: it is
+two things to keep in step, and a chance for them to disagree."
   (let* ((state (if ham-rig--connection
                     (ham-connection-state ham-rig--connection)
                   'disconnected))
+         (model (cdr (cl-assoc "Model name" ham-rig--caps :test #'cl-equalp)))
          (where (propertize (format "%s:%d" ham-rig-host ham-rig-port)
                             'face 'ham-face-label))
          (retry (ham-connection-retry-in ham-rig--connection))
@@ -1289,30 +1494,20 @@ buffer."
             (_ (propertize (if (and retry (> retry 0))
                                (format "reconnecting in %.1fs" retry)
                              "not connected")
-                           'face 'ham-face-danger))))
-         (freq (ham-rig-get 'frequency))
-         (reading
-          (when (and (eq state 'connected) freq)
-            (concat "  " (propertize (format "%.6f" (/ freq 1000000.0))
-                                     'face 'ham-face-value)
-                    " " (propertize "MHz" 'face 'ham-face-unit)
-                    "  " (propertize (or (ham-rig-current-mode) "?")
-                                     'face 'ham-face-value)))))
-    (concat (propertize "Rig" 'face 'ham-face-label) "  " where "  " shown
-            (or reading ""))))
+                           'face 'ham-face-danger)))))
+    (concat (propertize (or model "Rig") 'face 'ham-face-label)
+            "  " where "  " shown)))
 
 (defun ham-rig--render ()
   "Return the panel contents as a string."
   (let* ((freq (ham-rig-frequency))
          (band (and freq (ham-band-for-frequency freq)))
          (tx (ham-rig-ptt-p))
-         (db (ham-rig-get 'strength))
-         (model (cdr (cl-assoc "Model name" ham-rig--caps :test #'cl-equalp))))
+         (db (ham-rig-get 'strength)))
     (concat
      (ham-panel-header
       (ham-rig--status-line)
-      (concat "? keys   g refresh   c connect   d disconnect   q bury"
-              (if model (concat "   " model) "")))
+      "? keys   g refresh   c connect   d disconnect   q bury")
      ham-panel-indent
      (propertize (if freq (ham-format-frequency freq) "---.---.---")
                  'face 'ham-rig-frequency)
@@ -1322,7 +1517,7 @@ buffer."
        (if (>= step 1000)
            (format "%g k" (/ step 1000.0))
          (format "%d " step)))
-     "\n\n" ham-panel-indent
+     "\n\n  "
      (propertize "VFO " 'face 'ham-rig-label)
      (format "%-6s" (or (ham-rig-get 'vfo) "--"))
      (propertize "  MODE " 'face 'ham-rig-label)
@@ -1334,7 +1529,7 @@ buffer."
      (if (ham-rig-get 'split)
          (format "%s" (or (ham-rig-get 'split-vfo) "on"))
        "off")
-     "\n\n" ham-panel-indent
+     "\n\n  "
      (if tx
          (concat (propertize "TX" 'face 'ham-rig-tx)
                  (if ham-rig--tx-started-at
@@ -1349,6 +1544,9 @@ buffer."
                (ham-rig--bar (and db (/ (+ db 54.0) 114.0)) ham-rig-smeter-width)
                "  "
                (format "%-6s" (ham-rig--s-label db))))
+     ;; No key footer.  The reminder is in the header now, where it is
+     ;; on screen whatever the panel drew below it, and repeating it at
+     ;; the bottom only pushed the meters further up.
      "\n")))
 
 (defun ham-rig--redisplay ()
@@ -1367,14 +1565,8 @@ buffer."
             (goto-char (point-min))
             (forward-line (1- line))))))))
 
-(defun ham-rig--schedule-redisplay ()
-  "Coalesce repaints onto an idle timer."
-  (unless ham-rig--redisplay-timer
-    (setq ham-rig--redisplay-timer
-          (run-with-idle-timer 0.05 nil #'ham-rig--redisplay))))
-
 (defun ham-rig--countdown-tick ()
-  "Repaint so the reconnection countdown keeps moving."
+  "Repaint the panel to advance the reconnection countdown."
   (if (or (null ham-rig--connection)
           (eq (ham-connection-state ham-rig--connection) 'connected))
       (ham-rig--stop-countdown)
@@ -1392,6 +1584,12 @@ buffer."
   (when (timerp ham-rig--countdown-timer)
     (cancel-timer ham-rig--countdown-timer))
   (setq ham-rig--countdown-timer nil))
+
+(defun ham-rig--schedule-redisplay ()
+  "Coalesce repaints onto an idle timer."
+  (unless ham-rig--redisplay-timer
+    (setq ham-rig--redisplay-timer
+          (run-with-idle-timer 0.05 nil #'ham-rig--redisplay))))
 
 
 ;;;; Controls discovered from the rig
@@ -1902,11 +2100,11 @@ stare at a screen of dashes."
   "+" #'ham-rig-control-increase
   "-" #'ham-rig-control-decrease
   "RET" #'ham-rig-control-toggle
+  "SPC" #'ham-rig-control-toggle
   "=" #'ham-rig-control-set
   "g" #'ham-rig-controls-refresh
   "?" #'ham-rig-help
-  "q" #'quit-window
-  "L" #'ham-show-log)
+  "h" #'ham-rig-help)
 
 (define-derived-mode ham-rig-controls-mode special-mode "Rig Controls"
   "Major mode for the rig's levels and functions."
@@ -1954,14 +2152,13 @@ and nothing it cannot."
   "c" #'ham-rig-connect
   "d" #'ham-rig-disconnect
   "?" #'ham-rig-help
-  "q" #'quit-window
+  "h" #'ham-rig-help
   "i" #'ham-rig-show-capabilities
   "u" #'ham-rig-toggle-tuner
   "A" #'ham-rig-tune-atu
   "P" #'ham-rig-toggle-power
   "C" #'ham-rig-controls
-  "S" #'ham-rig-show-stats
-  "L" #'ham-show-log)
+  "S" #'ham-rig-show-stats)
 
 (easy-menu-define ham-rig-mode-menu ham-rig-mode-map
   "Menu for `ham-rig-mode'."
@@ -1982,7 +2179,6 @@ and nothing it cannot."
     ["Levels and functions" ham-rig-controls :keys "C"]
     ["Rig capabilities" ham-rig-show-capabilities :keys "i"]
     ["Link statistics" ham-rig-show-stats :keys "S"]
-    ["Show the ham log" ham-show-log :keys "L"]
     "---"
     ["Connect" ham-rig-connect :keys "c"]
     ["Disconnect" ham-rig-disconnect :keys "d"]
@@ -1993,26 +2189,52 @@ and nothing it cannot."
     "---"
     ["Bury panel" quit-window :keys "q"]))
 
+(defun ham-rig--keymap-rows (keymap)
+  "Return (KEY . SUMMARY) for every command bound in KEYMAP."
+  (let (rows)
+    (map-keymap
+     (lambda (event definition)
+       (when (commandp definition)
+         (push (cons (key-description (vector event))
+                     (let ((doc (documentation definition)))
+                       (if doc (car (split-string doc "\n")) "")))
+               rows)))
+     keymap)
+    ;; `map-keymap' walks in reverse insertion order, which is no order
+    ;; at all to read a key list in.
+    (sort rows (lambda (a b) (string-lessp (car a) (car b))))))
+
+(defun ham-rig--insert-key-table (title keymap)
+  "Insert a table of the bindings in KEYMAP under TITLE."
+  (insert (propertize (concat title "\n") 'face 'bold))
+  (dolist (row (ham-rig--keymap-rows keymap))
+    (insert (format "  %-12s %s\n"
+                    (propertize (car row) 'face 'ham-rig-meter)
+                    (cdr row))))
+  (insert "\n"))
+
+;;;###autoload
 (defun ham-rig-help ()
   "Show every key the rig panels bind."
   (interactive)
-  (ham-with-help-buffer "*ham-rig-help*" "Rig   keys"
-    (ham-insert-key-table "Rig panel" ham-rig-mode-map)
-    (ham-insert-key-table "Controls panel" ham-rig-controls-mode-map)
-    (ham-insert-legend
-     "Link states"
-     '(("connected" ham-face-ok "Talking to rigctld")
-       ("connecting" ham-face-warn "Waiting for rigctld to answer")
-       ("reconnecting" ham-face-danger "Link down; the countdown is the next try")))
-    (insert (propertize "Commands with no key\n" 'face 'ham-face-heading))
-    (dolist (command '(ham-rig ham-rig-controls ham-rig-connect
-                               ham-rig-disconnect ham-rig-power-on
-                               ham-rig-power-off ham-rig-read-power-state
-                               ham-rig-set-tuning-step ham-rig-show-stats
-                               ham-rig-show-capabilities ham-rig-panic-unkey))
-      (insert (format "%s%-28s %s\n" ham-panel-indent (symbol-name command)
-                      (let ((doc (documentation command)))
-                        (if doc (car (split-string doc "\n")) "")))))))
+  (with-current-buffer (get-buffer-create "*ham-rig-help*")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (ham-rig--insert-key-table "Rig panel" ham-rig-mode-map)
+      (ham-rig--insert-key-table "Controls panel" ham-rig-controls-mode-map)
+      (insert (propertize "Commands with no key\n" 'face 'bold))
+      (dolist (command '(ham-rig ham-rig-controls ham-rig-connect
+                                 ham-rig-disconnect ham-rig-power-on
+                                 ham-rig-power-off ham-rig-read-power-state
+                                 ham-rig-set-tuning-step ham-rig-show-stats
+                                 ham-rig-show-capabilities ham-rig-panic-unkey))
+        (insert (format "  %-28s %s\n"
+                        (symbol-name command)
+                        (let ((doc (documentation command)))
+                          (if doc (car (split-string doc "\n")) "")))))
+      (goto-char (point-min)))
+    (special-mode)
+    (pop-to-buffer (current-buffer))))
 
 (define-derived-mode ham-rig-mode special-mode "Rig"
   "Major mode for the transceiver control panel."
