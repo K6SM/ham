@@ -36,6 +36,9 @@ Everything works in a terminal.
   shipped with Windows since 10/1803. Without it the panel falls back to
   Emacs's own `url.el`, whose connection setup can block the editor when the
   network is unreachable.
+- An audio transport, optional, for `ham-remote` — [Mumble](https://www.mumble.info/)
+  is the one to start with, and [Getting started with audio](#getting-started-with-audio)
+  walks through it from nothing. `trx` and `zita-njbridge` are alternatives.
 
 Developed on Emacs 29.3 and Hamlib 4.5.5, tested with a Yaesu FTDX10.
 
@@ -264,13 +267,185 @@ the audio, in both directions, and `M-x ham-remote` shows what it is doing:
 | Key | Action |
 | --- | --- |
 | `s` `S` | Start / stop the audio |
-| `r` | Restart both directions |
+| `r` | Restart |
 | `R` | Show what to run at the radio end |
+| `M` | Mumble client settings |
+| `w` | Write a Mumble server configuration |
 | `g` | Refresh |
 
-No audio passes through Emacs. Two external programs carry it — one per
-direction — and this package starts them, restarts them if they die, sequences
-them against PTT, and reports their state.
+No audio passes through Emacs. External programs carry it, and this package
+starts them, restarts them if they die, sequences them against PTT, and reports
+their state.
+
+### Getting started with audio
+
+If you have not used Mumble before, start here. Mumble is a voice chat system;
+we are using it as a two-way audio link with a radio on one end. Nothing about
+it is ham-specific, which is why its defaults are wrong for us in a few
+important ways — this section gets you from nothing to a working link.
+
+**Three pieces, on two machines.**
+
+```
+   your desk                          the radio
+  ┌──────────────┐                  ┌──────────────────────┐
+  │ Mumble       │                  │ Mumble client        │
+  │ client       │ ◄──────────────► │ (mic = receiver out, │
+  │ (headset)    │      audio       │  speaker = rig mic)  │
+  │              │                  │                      │
+  │ Emacs        │ ◄──────────────► │ rigctld              │
+  │ ham-rig      │   rig control    │                      │
+  │ ham-remote   │                  │ Mumble server ◄──────┼── usually here
+  └──────────────┘                  └──────────────────────┘
+```
+
+Both ends run a Mumble **client**. One machine also runs the Mumble **server**,
+which the two clients meet on. The server normally lives at the radio end — a
+Raspberry Pi is plenty — but it can be anywhere both ends can reach.
+
+The server is what makes this easier than a direct connection: only one machine
+needs a reachable address, and it is the one that stays put.
+
+#### 1. Install
+
+| | Client | Server |
+| --- | --- | --- |
+| Debian, Ubuntu, Raspberry Pi OS | `sudo apt install mumble` | `sudo apt install mumble-server` |
+| Fedora | `sudo dnf install mumble` | `sudo dnf install mumble-server` |
+| Arch | `sudo pacman -S mumble` | `sudo pacman -S murmur` |
+| macOS | `brew install --cask mumble` | run it on Linux instead |
+| Windows | installer from mumble.info | installer from mumble.info |
+| FreeBSD | `pkg install mumble` | `pkg install murmur` |
+
+Install the **client** on both machines and the **server** on one of them.
+
+The server binary is called `mumble-server` on newer packages and `murmurd` on
+older ones; `ham-remote` looks for both, so you do not need to know which you
+have.
+
+#### 2. Set up the server
+
+On Debian and Raspberry Pi OS the package asks the important questions for you:
+
+```
+sudo dpkg-reconfigure mumble-server
+```
+
+Say yes to starting at boot. It will ask you to set a **SuperUser** password —
+that is the server's administrator account, and you only need it if you later
+want to change server settings from inside a client. Write it down anyway.
+
+Elsewhere, or to set it again later:
+
+```
+sudo mumble-server -ini /etc/mumble-server.ini -supw YOUR-PASSWORD
+```
+
+On older packages that binary is `murmurd`; the arguments are the same.
+
+Then replace the stock configuration with one tuned for a radio link. In Emacs,
+on the machine that will run the server:
+
+```
+M-x ham-remote-mumble-write-server-config
+```
+
+That writes a file (see `ham-remote-mumble-server-config` for where). Copy it
+over `/etc/mumble-server.ini`, keeping a backup, and restart the service:
+
+```
+sudo systemctl restart mumble-server
+```
+
+Run it under the system's own service manager rather than from Emacs: the
+server should be up whether or not anyone is logged in. `ham-remote` *can* run
+it — set `ham-remote-mumble-run` to `server` or `both` — which is handy for
+trying the whole thing out on one machine before you commit to wiring.
+
+What it changes and why is in [Mumble](#mumble) below; the short version is
+that it forces Opus, keeps the user count small, and stops the server writing
+a log that would wear out an SD card.
+
+**Open the port.** Mumble uses **64738**, both TCP and UDP. TCP carries the
+control connection and UDP carries the voice; if UDP cannot get through, Mumble
+still works but routes voice over TCP, which is noticeably worse. If the radio
+is across the internet rather than the house, forward both on the router, or —
+better — put both machines on a VPN and skip the forwarding entirely. You want
+the VPN anyway: `rigctld` has no authentication of its own.
+
+#### 3. Set up the client at your desk
+
+Run `mumble` once by hand before involving Emacs. On first launch it offers two
+wizards:
+
+- The **Audio Wizard** picks your input and output devices and sets levels. Run
+  it — device selection is the fiddly part and it does it well.
+- The **Certificate Wizard** creates your identity. Mumble authenticates by
+  certificate rather than by password, so accept the default and let it make
+  one.
+
+**Then undo some of what the Audio Wizard did.** It is tuned for a headset in a
+quiet room and will have enabled things that ruin a radio link. Press `M` in
+the `ham-remote` panel — or `M-x ham-remote-show-mumble-setup` — for the full
+list; the ones that matter are echo cancellation, noise suppression and gain
+control (all **off**) and transmit mode (**Push To Talk**).
+
+Now tell `ham-remote` where the server is:
+
+```elisp
+(setq ham-remote-host "radio.local"        ; the machine running the server
+      ham-remote-transport "mumble"
+      ham-remote-mumble-user "K6SM"        ; your callsign
+      ham-remote-mumble-run 'client)
+```
+
+`M-x ham-remote`, then `s`. The panel should show `Mumble  running`.
+
+#### 4. Set up the client at the radio
+
+The radio end runs a Mumble client too, with two differences: its microphone is
+the receiver rather than a person, and it transmits **continuously** — there is
+nobody there to key it.
+
+Wire the audio first. You need the receiver's audio going into the machine's
+input, and the machine's output going into the transmitter's audio input. Most
+modern transceivers present a USB sound device that does both; otherwise an
+interface like a SignaLink sits between. Pick that device — not the machine's
+built-in one — in Mumble's Audio Wizard.
+
+`R` in the panel prints the exact command and settings for this end.
+
+Set the transmit level with the rig's ALC meter, not by ear: bring the audio up
+until ALC just begins to move and stop there.
+
+#### 5. Check it works
+
+1. At your desk, `M-x ham-remote` and `s`. The panel shows `Mumble running`.
+2. You should hear the band. If not, the problem is at the radio end's input.
+3. `M-x ham-rig`, connect, and key with `t`. The panel's `MIC` should flip from
+   `shut` to `open`, and the radio should transmit your voice.
+4. Unkey. `MIC` goes back to `shut`.
+
+That `MIC` line is worth watching. `ham-remote` holds the Mumble microphone
+closed except while the rig is keyed, so your shack is not on the air between
+overs — but that only works if Mumble is in **Push To Talk** mode. If `MIC`
+says `open` when you are not transmitting, that setting is wrong.
+
+#### When it does not work
+
+| Symptom | Usually |
+| --- | --- |
+| No audio either way | Server not reachable: check port 64738 TCP **and** UDP |
+| Audio breaks up | Raise the jitter buffer 10 ms at a time |
+| Everything sounds far away and thin | Noise suppression or AGC still on |
+| Weak signals vanish into silence | Noise suppression |
+| Digital modes will not decode | Any of the three processors; or use a lossless back end |
+| First syllable clipped | Mumble in voice-activated mode, not Push To Talk |
+| `MIC open` with the rig unkeyed | Mumble not in Push To Talk mode |
+| Delay grows the longer you talk | Buffering somewhere; restart the client |
+| Hum on transmit | Ground loop — an isolating interface, not a software fix |
+
+`M-x ham-remote-show-mumble-setup` lists every setting and what it is for.
 
 ### Choosing a transport
 
@@ -281,17 +456,80 @@ Which program carries the audio is a **back end**, selected by name in
 | --- | --- | --- |
 | `trx` | Opus over RTP; low bandwidth | `trx` |
 | `zita-njbridge` | Uncompressed samples | `zita-njbridge`, JACK |
+| `mumble` | Opus through a Mumble server | `mumble`, `mumble-server` |
 
 Every command is a list of strings you can edit —
 `ham-remote-trx-transmit-command` and friends — with `%h` for host, `%p` port,
-`%d` device, `%r` sample rate and `%c` channels. Correct them there if your
-build's options differ; no code changes are needed. Register your own back end
-with `ham-remote-register-transport`.
+`%d` device, `%r` sample rate, `%c` channels, `%m` the program, `%u` user,
+`%n` channel and `%U` a `mumble://` URL. Correct them there if your build's
+options differ; no code changes are needed. Register your own back end with
+`ham-remote-register-transport`.
+
+`trx` and `zita-njbridge` are pairs of one-way pipes: one process per
+direction. Mumble is not — one client carries both ways, and a server sits in
+the middle. A back end says which processes it needs, so both shapes work.
 
 For `trx`, the latency control is the Opus frame size, `-f`, in samples: at
 48 kHz the codec permits 120, 240, 480 or 960 — 2.5, 5, 10 or 20 ms. The
 receiver's jitter buffer, `-j`, trades delay against tolerance of an uneven
 network.
+
+### Mumble
+
+Mumble is the one back end that is not a pair of pipes between two hosts. A
+server sits in the middle, which is why it is worth having: it crosses NAT from
+both sides, it survives an address that changes, and more than one person can
+listen to the same radio.
+
+`ham-remote-mumble-run` says which halves this machine runs — `client` at the
+operator end, `server` on the machine at the radio end, `both` to try it on one
+box. `M-x ham-remote` starts and stops whichever apply, watches them, and
+restarts them if they die.
+
+**The microphone follows the transmitter.** Mumble is otherwise open all the
+time, which puts the shack on the air between overs, or listening for a voice,
+which clips the first syllable and opens on a cough. With
+`ham-remote-mumble-follow-ptt` set, keying the rig runs `mumble rpc
+starttalking` and unkeying runs `stoptalking`, so the microphone is open only
+while the transmitter is. The panel shows `MIC open` or `MIC shut` — an open
+microphone nobody noticed is the failure worth seeing. **This requires Mumble
+to be in Push To Talk mode**; in continuous or voice-activated mode the gating
+does nothing.
+
+`M` prints the client settings a remote station wants. The ones that matter:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Echo cancellation | **off** | |
+| Noise suppression | **off** | A weak signal is exactly what it removes |
+| Amplification / AGC | **off** | |
+| Transmit | Push To Talk | So the rig's PTT can drive it |
+| Audio per packet | 10 ms | The main latency control |
+| Quality | 72 kb/s | ≥64 kb/s enables Opus low delay mode |
+| Jitter buffer | 20 ms, then raise | Jitter breaks audio; latency alone does not |
+| Text to speech, sounds | off | They would go out over the air |
+
+The first three are on by default and are each a model of a human voice in a
+quiet room. What crosses this link is often neither — a signal at the noise
+floor, or a modulated waveform carrying data. Leave them on and the band sounds
+dead and digital modes stop decoding.
+
+`w` writes a server configuration. It sets `opusthreshold=0`, which forces Opus
+whatever connects: a server falls back to CELT the moment one old client
+appears, which costs more CPU and sounds worse. On a Raspberry Pi Zero 2W that
+is the difference between working and not. It also keeps `users` small and sets
+`logdays=0`, since the server writes its log to SQLite and on a machine booting
+off an SD card those writes are what wears it out.
+
+The server neither mixes nor transcodes — it forwards packets — so its load is
+per-client crypto and networking rather than audio work. A Pi handles a remote
+station's two or three clients comfortably.
+
+Mumble authenticates by certificate, so no password appears on any command
+line, where every process list on the machine could read it. A server that
+needs one should be saved in the client's own server list.
+
+Mumble compresses, so `ham-remote-require-lossless` refuses it — see below.
 
 ### Compressed audio and digital voice
 
@@ -481,6 +719,13 @@ argued about.
 | `ham-rig-atu-timeout` | `20` | Expected length of a tuner cycle, in seconds |
 | `ham-remote-host` | `radio.local` | Machine at the radio end |
 | `ham-remote-transport` | `trx` | Which back end carries the audio |
+| `ham-remote-mumble-run` | `client` | Which halves of Mumble this machine runs |
+| `ham-remote-mumble-follow-ptt` | `t` | Microphone open only while keyed |
+| `ham-remote-mumble-user` | login name | Name to join the server under |
+| `ham-remote-mumble-channel` | `nil` | Channel to join, or the default |
+| `ham-remote-mumble-port` | `64738` | Mumble's registered port |
+| `ham-remote-mumble-bandwidth` | `72000` | Per-client ceiling, bits per second |
+| `ham-remote-mumble-users` | `4` | Slots the server admits |
 | `ham-remote-require-lossless` | `nil` | Refuse a back end that compresses |
 | `ham-rig-meter-ranges` | VDD, ID, comp | Range to draw a meter over |
 | `ham-rig-meter-zones` | SWR, ALC | Where a bar turns amber and red |
