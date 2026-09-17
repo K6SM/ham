@@ -193,16 +193,21 @@ timeout timer.**
   FTDX-10   controls
 
   LEVELS
-    PREAMP       ######.... AMP1    IPO/AMP1/AMP2
-    RFPOWER      #####..... 50 W    5%..100%
-    DNR          ####...... 40%     0%..100%
-    MICGAIN      ####...... 35%     0%..100%
-    KEYSPD       ###....... 22      4..60
-    IF           #####..... -200    -1200..1200
+    PREAMP             ######.... AMP1    IPO/AMP1/AMP2
+    RFPOWER            #####..... 50 W    5%..100%
+    DNR                ####...... 40%     0%..100%
+    MICGAIN            ####...... 35%     0%..100%
+    KEYSPD             ###....... 22      4..60
+    Filter width       #####..... 2.4 kHz 200 Hz..4 kHz
+    IF                 #####..... -200    -1200..1200
 
   FUNCTIONS
-    TUNER        on
-    VOX          off
+    TUNER              on
+    VOX                off
+
+  THIS RADIO
+    Roofing filter     #####..... 3 kHz   AUTO/12 kHz/3 kHz/500 Hz/300 Hz (optional)
+    Contour            .......... off     off/on
 ```
 
 | Key | Action |
@@ -220,6 +225,10 @@ blanker, CW speed and pitch, mic gain, VOX gain and delay, monitor level,
 compression, break-in delay, preamp, attenuator, squelch, AF and RF gain, and
 switches for the tuner, VOX, ANF, APF, manual notch and RIT. A different radio
 gives a different panel.
+
+Three sections: Hamlib's standard levels, its standard switches, and under
+**THIS RADIO** the backend's own — see
+[Roofing filter, contour, and the rest of this radio](#roofing-filter-contour-and-the-rest-of-this-radio).
 
 Read-only meters stay out of this panel. Controls the radio reports with no
 usable range are omitted, unless the rig describes them some other way.
@@ -260,28 +269,47 @@ The receive filter width is not a Hamlib level. It travels with the mode —
 `M <mode> <width>` sets both, `m` reports both — so `w` sends the mode the rig
 last reported along with the new width, and `C-u m` sets the two together.
 
-Completion offers the rig's own filter list where the backend publishes one
-under `Filters`; several backends, the Yaesu ones included, do not, so
-`ham-rig-passband-widths` supplies a sensible set per mode. Any number may be
-typed regardless, and the rig settles on the nearest filter it actually has.
+It is also in the controls panel, immediately before IF shift, which is where
+it sits on the radio and next to the other controls that shape the passband.
+The panel builds itself from Hamlib's level list, and the width is not on it,
+so that row is made rather than discovered: it reads through `m` and writes
+through `M`. Otherwise it behaves like RFPOWER or IF shift — `←` and `→` slide
+it in steps, and the row shows the range it may be set to.
 
-### Roofing filter
+That range is continuous rather than a short list of presets. Most backends
+declare `RIG_FLT_ANY`, meaning the radio takes whatever width it is sent: the
+FTDX10 does, and it adjusts in 50 Hz steps across the whole SSB range, which a
+handful of named filters does not reach. `ham-rig-passband-ranges` holds the
+range and step per mode, widened by any filter list the backend does publish
+under `Filters`, so a rig offering something outside the default still gets it.
+Change mode and the range changes with it.
 
-Not available, and not for want of trying: **Hamlib has no roofing filter
-level or function at all.** The level flags in `hamlib/rig.h` run out at
-`AGC_TIME`, and nothing in the set names a roofing filter, so there is no
-generic way to reach one — this is a gap in Hamlib rather than in this
-package. Contour is the same.
+### Roofing filter, contour, and the rest of this radio
 
-On a Yaesu the roofing filter is reachable by raw CAT (`RF0;` and friends) if
-you are willing to send rig-specific strings through `rigctl -w`. Nothing here
-does that: a raw command that a backend does not know about can leave Hamlib's
-idea of the radio and the radio itself disagreeing, and this package would
-rather offer a control it can read back.
+Hamlib has two kinds of level. The ones under `Set level` are its standard
+set — named by the library, the same on every radio. The ones under **`Extra
+levels`** are the backend's own, and that is where anything one manufacturer
+does on its own lives. On a Yaesu that is the roofing filter, the contour, the
+audio peak filter and the keyer.
 
-IF slope tuning is a different matter and does work where the rig reports it:
-`SLOPE_LOW` and `SLOPE_HIGH` are ordinary levels in Hz and appear in the
-controls panel like anything else.
+The controls panel reads both. Extension levels get their own heading, since
+they are the controls this radio has and a generic one does not:
+
+```
+  THIS RADIO
+    Roofing filter     #####..... 3 kHz   AUTO/12 kHz/3 kHz/500 Hz/300 Hz (optional)
+    Contour            .......... off     off/on
+    Contour frequency  #####..... 1600    10..3200
+```
+
+The names and the positions come from the rig. Hamlib prints each one as a
+block naming its type, its label and either its range or its values, and the
+panel reads all of it — so the roofing filter offers exactly the filters
+fitted, under the words Yaesu uses for them.
+
+These are read and written with the same `l`/`L` commands as any other level:
+`rigctl` looks a name up in the standard set first and falls back to the
+backend's own, so nothing special is needed to reach them.
 
 ## Operating remotely
 
@@ -768,7 +796,7 @@ argued about.
 | `ham-rig-meter-units` | comp, VDD, ID | Full scale for normalised meters |
 | `ham-rig-meter-zones` | SWR at 2 and 3 | Where a meter turns amber and red |
 | `ham-rig-controls-exclude` | `nil` | Controls to omit |
-| `ham-rig-passband-widths` | per mode | Filter widths offered where the rig lists none |
+| `ham-rig-passband-ranges` | per mode | Filter width range and step, as (MODE MIN MAX STEP) |
 | `ham-rig-poll-when-hidden` | `nil` | Keep polling with no panel visible |
 | `ham-frequency-format` | `dotted` | `14.074.000`, `khz` or `mhz` |
 | `ham-band-default-frequencies` | digital calling | Where `b` moves on each band |

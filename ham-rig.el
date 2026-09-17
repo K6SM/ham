@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.2.0
+;; Version: 0.2.2
 ;; Package-Requires: ((emacs "29.1") (ham "0.1.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -415,6 +415,13 @@ the rig, and only the words for them are local to a model."
 (defvar ham-rig--state (make-hash-table :test #'eq))
 (defvar ham-rig--caps nil
   "Alist of capability strings from \\dump_caps.")
+(defvar ham-rig--caps-raw nil
+  "The whole text of the last \\dump_caps reply.
+
+Kept because one part of it has structure the alist cannot hold.  Every
+other capability is one \"Key: value\" line, but the extension levels are
+an indented block of several lines per control, so several controls
+would collide on the keys Type, Label and Values.")
 (defvar ham-rig--vfo-mode nil
   "Non-nil if rigctld was started with -o and demands a VFO argument.")
 (defvar ham-rig--queue nil)
@@ -1023,6 +1030,7 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
    "\\dump_caps"
    (lambda (r)
      (setq ham-rig--caps (ham-rig-response-alist r))
+     (setq ham-rig--caps-raw (ham-rig-response-raw r))
      (setq ham-rig--dirty t ham-rig--controls-dirty t)
      ;; The controls panel cannot know what to show until the rig has
      ;; described itself, so fill it as soon as it has.
@@ -1192,24 +1200,39 @@ leave the rig on whatever filter the mode already uses."
   (ham-rig--set 'passband (ham-rig--labelled-num response "Passband"))
   (ham-rig--set 'mode (ham-rig--labelled-val response "Mode")))
 
-(defcustom ham-rig-passband-widths
-  '(("CW"   . (50 100 200 300 500 800 1200 2400))
-    ("CWR"  . (50 100 200 300 500 800 1200 2400))
-    ("RTTY" . (50 100 200 300 500 800 1200 2400))
-    ("RTTYR" . (50 100 200 300 500 800 1200 2400))
-    ("USB"  . (1500 1800 2000 2400 2600 2800 3000 3200))
-    ("LSB"  . (1500 1800 2000 2400 2600 2800 3000 3200))
-    ("AM"   . (3000 6000 9000))
-    ("FM"   . (9000 12000 15000)))
-  "Filter widths in Hz to offer for each mode, as (MODE . WIDTHS).
+(defcustom ham-rig-passband-ranges
+  '(("CW"    50 3000  50)
+    ("CWR"   50 3000  50)
+    ("RTTY"  50 3000  50)
+    ("RTTYR" 50 3000  50)
+    ("PKTUSB" 50 4000 50)
+    ("PKTLSB" 50 4000 50)
+    ("USB"  200 4000  50)
+    ("LSB"  200 4000  50)
+    ("AM"  3000 9000 1000)
+    ("FM"  9000 16000 1000))
+  "Filter widths each mode may be set to, as (MODE MIN MAX STEP) in Hz.
 
-Offered for completion only; any number may still be typed, and the rig
-settles on the nearest filter it actually has.  Hamlib reports a rig's
-real filter list under \"Filters\" in its capabilities, and that is used
-in preference to this where the backend provides it -- several,
-including the Yaesu ones, do not."
-  :type '(alist :key-type string :value-type (repeat integer))
+A range rather than a list of filters, because that is what the radio
+is.  Hamlib sends whatever number it is given and the rig settles on
+the nearest filter it has, then reports back which -- so asking for
+2450 on an FTDX10 gets 2400, and the panel shows 2400 because that is
+what the rig said.  Pinning this to a handful of named widths would
+hide every filter between them.
+
+Where the rig publishes its own filter list this is widened to cover it
+if it reaches further, never narrowed: a backend naming three SSB
+filters is naming the common ones, not the only ones.  The Yaesu
+backends declare RIG_FLT_ANY for SSB and CW, which is Hamlib saying in
+so many words that any width goes."
+  :type '(alist :key-type string
+                :value-type (list (integer :tag "Minimum Hz")
+                                  (integer :tag "Maximum Hz")
+                                  (integer :tag "Step Hz")))
   :group 'ham-rig)
+
+(defconst ham-rig--passband-fallback '(50 4000 50)
+  "Range in Hz for a mode `ham-rig-passband-ranges' does not name.")
 
 (defun ham-rig--filters-for-mode (mode)
   "Return the filter widths in Hz the rig reports for MODE, or nil.
@@ -1219,7 +1242,7 @@ Hamlib prints them as lines of \"MODE: width1 width2 ...\" under
   (let ((filters (ham-rig--caps-value "Filters"))
         (widths nil))
     (when (and filters mode)
-      (dolist (line (split-string filters "\n" t))
+      (dolist (line (if (listp filters) filters (split-string filters "\n" t)))
         (when (string-match
                (concat "\\_<" (regexp-quote mode) "\\_>[^0-9]*\\(.*\\)") line)
           (dolist (field (split-string (match-string 1 line) "[ \t,]+" t))
@@ -1227,25 +1250,29 @@ Hamlib prints them as lines of \"MODE: width1 width2 ...\" under
               (push (string-to-number field) widths))))))
     (sort (delete-dups widths) #'<)))
 
-(defun ham-rig-passband-choices (&optional mode)
-  "Return the filter widths in Hz worth offering for MODE.
-The rig's own list where it has one, otherwise
-`ham-rig-passband-widths'."
-  (let ((mode (or mode (ham-rig-current-mode))))
-    (or (ham-rig--filters-for-mode mode)
-        (cdr (assoc mode ham-rig-passband-widths))
-        (cdr (assoc (upcase (or mode "")) ham-rig-passband-widths)))))
+(defun ham-rig-passband-range (&optional mode)
+  "Return (MIN MAX STEP) in Hz for MODE, defaulting to the current mode."
+  (let* ((mode (or mode (ham-rig-current-mode)))
+         (entry (or (cdr (assoc mode ham-rig-passband-ranges))
+                    (cdr (assoc (upcase (or mode "")) ham-rig-passband-ranges))
+                    ham-rig--passband-fallback))
+         (reported (ham-rig--filters-for-mode mode)))
+    (if reported
+        ;; Widen to whatever the rig named, never narrow to it.
+        (list (min (nth 0 entry) (car reported))
+              (max (nth 1 entry) (car (last reported)))
+              (nth 2 entry))
+      entry)))
 
 (defun ham-rig--read-passband (&optional mode)
   "Prompt for a filter width in Hz for MODE, and return it."
-  (let* ((choices (mapcar #'number-to-string
-                          (ham-rig-passband-choices mode)))
+  (let* ((range (ham-rig-passband-range mode))
          (current (ham-rig-get 'passband))
-         (answer (completing-read
-                  (format "Filter width in Hz%s: "
-                          (if current (format " (now %d)" current) ""))
-                  choices nil nil nil nil
-                  (and current (number-to-string current)))))
+         (answer (read-string
+                  (format "Filter width in Hz (%d-%d)%s: "
+                          (nth 0 range) (nth 1 range)
+                          (if current (format " [now %d]" current) ""))
+                  nil nil (and current (number-to-string current)))))
     (if (string-match-p "\\`[ \t]*[0-9]+[ \t]*\\'" answer)
         (string-to-number answer)
       (user-error "Not a width in Hz: %s" answer))))
@@ -1692,7 +1719,7 @@ two things to keep in step, and a chance for them to disagree."
 
 (cl-defstruct (ham-rig--control (:constructor ham-rig--control-create)
                                 (:copier nil))
-  kind name min max step)
+  kind name min max step values title)
 
 (defun ham-rig--caps-value (&rest keys)
   "Return the capability string for the first of KEYS reported by the rig."
@@ -1719,6 +1746,113 @@ two things to keep in step, and a chance for them to disagree."
             (ham-rig--control-create :kind 'func :name name))
           (and string (split-string string "[ \t]+" t))))
 
+(defun ham-rig--parse-ext-levels (text)
+  "Return the extension levels described in TEXT, a \dump_caps reply.
+TEXT is the reply's lines, as a list or as one newline-separated string.
+
+Hamlib has two kinds of level.  The ones in `Set level\=' are the
+standard set, named by the library and the same on every radio.  The
+ones under `Extra levels\=' are the backend\='s own, and are where anything
+a single manufacturer does lives -- on a Yaesu that is the roofing
+filter, the contour, the audio peak filter and the keyer.
+
+They are printed as a block per level rather than as one line:
+
+    Extra levels:
+    \tROOFINGFILTER
+    \t\tType: COMBO
+    \t\tLabel: Roofing filter
+    \t\tValues: 0=\"AUTO\" 1=\"12 kHz\" 2=\"3 kHz\" 3=\"500 Hz\"
+
+which is why they are read from the reply rather than from the alist
+every other capability comes from: several levels would collide on
+Type, Label and Values."
+  (let ((controls nil) (name nil) (title nil)
+        (values nil) (min nil) (max nil) (step nil) (in nil))
+    (cl-flet ((finish ()
+                (when (and name in)
+                  (push (ham-rig--control-create
+                         :kind 'ext :name name :title title
+                         :values (nreverse values)
+                         :min (or min 0) :max (or max 0) :step (or step 0))
+                        controls))
+                (setq name nil title nil values nil
+                      min nil max nil step nil)))
+      (dolist (line (if (listp text) text (split-string (or text "") "\n")))
+        (cond
+         ;; The block starts here and runs to the next unindented line.
+         ((string-match-p "\\`Extra levels:" line) (finish) (setq in t))
+         ((and in (string-match-p "\\`[^ \t]" line)) (finish) (setq in nil))
+         ((not in) nil)
+         ;; One tab in: the name of a level, and the end of the last one.
+         ((string-match "\\`\t\\([A-Z0-9_]+\\)[ \t]*\\'" line)
+          (finish)
+          (setq name (match-string 1 line)))
+         ((string-match "\\`\t\t\\([A-Za-z]+\\):[ \t]*\\(.*\\)\\'" line)
+          (let ((key (match-string 1 line))
+                (value (string-trim (match-string 2 line))))
+            (cond
+             ((equal key "Label") (setq title (and (not (string-empty-p value))
+                                                   value)))
+             ((equal key "Values")
+              ;; 0="AUTO" 1="12 kHz" ... -- the number is what gets sent
+              ;; and the words are what the operator reads.
+              (let ((start 0))
+                (while (string-match "\\([0-9]+\\)=\"\\([^\"]*\\)\"" value start)
+                  (push (cons (string-to-number (match-string 1 value))
+                              (match-string 2 value))
+                        values)
+                  (setq start (match-end 0)))))
+             ((equal key "Range")
+              (when (string-match
+                     "\\(-?[0-9.]+\\)\\.\\.\\(-?[0-9.]+\\)/\\(-?[0-9.]+\\)" value)
+                (setq min (string-to-number (match-string 1 value))
+                      max (string-to-number (match-string 2 value))
+                      step (string-to-number (match-string 3 value))))))))))
+      (finish))
+    ;; A CHECKBUTTON is a switch and reads better as one.
+    (dolist (control controls)
+      (when (and (null (ham-rig--control-values control))
+                 (zerop (ham-rig--control-max control)))
+        (setf (ham-rig--control-values control) '((0 . "off") (1 . "on")))))
+    (nreverse controls)))
+
+(defun ham-rig--ext-levels ()
+  "Return the extension levels the connected rig declared."
+  (ham-rig--parse-ext-levels ham-rig--caps-raw))
+
+(defun ham-rig--width-control ()
+  "Return a control for the receive filter width, or nil without a mode.
+
+Hamlib has no level for the filter width -- it carries it with the mode,
+so `M\=' sets both and `m\=' reports both -- and the controls panel is built
+from the level list, which is why the width was missing from a panel
+that had IF shift, slope tuning and passband tuning all present.  It is
+the knob next to those on the radio.
+
+So one is made here, reading and writing through the mode.  It is a
+range like any other level rather than a short list of named filters:
+the rig accepts any width and settles on the nearest it has, and a list
+would hide every filter between the ones named."
+  (when (ham-rig-current-mode)
+    (let ((range (ham-rig-passband-range)))
+      (ham-rig--control-create
+       :kind 'width :name "WIDTH" :title "Filter width"
+       :min (nth 0 range) :max (nth 1 range) :step (nth 2 range)))))
+
+(defun ham-rig--insert-width (levels width)
+  "Return LEVELS with WIDTH inserted, just before IF shift where there is one.
+
+Beside the other controls that shape the passband rather than at the
+end of the list, because that is where it is on the radio."
+  (cond
+   ((null width) levels)
+   ((cl-find "IF" levels :key #'ham-rig--control-name :test #'equal)
+    (cl-loop for control in levels
+             when (equal (ham-rig--control-name control) "IF") collect width
+             collect control))
+   (t (append levels (list width)))))
+
 (defun ham-rig--control-list ()
   "Return every control this rig accepts, levels first then functions.
 
@@ -1726,14 +1860,17 @@ Only writable controls are offered.  Hamlib reports the meters -- signal
 strength, SWR, ALC and the rest -- under \"Get level\" but not under
 \"Set level\", which is exactly the distinction needed to keep read-only
 readings out of a panel whose purpose is changing things."
-  (let ((levels (ham-rig--parse-levels (ham-rig--caps-value "Set level")))
+  (let ((levels (ham-rig--insert-width
+                 (ham-rig--parse-levels (ham-rig--caps-value "Set level"))
+                 (ham-rig--width-control)))
         (funcs (ham-rig--parse-functions
-                (ham-rig--caps-value "Set functions" "Set func"))))
+                (ham-rig--caps-value "Set functions" "Set func")))
+        (ext (ham-rig--ext-levels)))
     (cl-remove-if (lambda (control)
                     (or (member (ham-rig--control-name control)
                                 ham-rig-controls-exclude)
                         (ham-rig--control-degenerate-p control)))
-                  (append levels funcs))))
+                  (append levels funcs ext))))
 
 (defun ham-rig--control-degenerate-p (control)
   "Return non-nil if CONTROL has no usable range and cannot be offered.
@@ -1774,9 +1911,15 @@ RFPOWER_METER would otherwise show power twice."
           (push (cons control (cdr entry)) meters))))))
 
 (defun ham-rig--control-label (control)
-  "Return the name to show for CONTROL."
+  "Return the name to show for CONTROL.
+
+The operator's own word for it first, then the one the backend gave --
+an extension level arrives carrying a readable label, and \"Roofing
+filter\" beats ROOFINGFILTER -- then the Hamlib name."
   (let ((name (ham-rig--control-name control)))
-    (or (cdr (assoc name ham-rig-control-labels)) name)))
+    (or (cdr (assoc name ham-rig-control-labels))
+        (ham-rig--control-title control)
+        name)))
 
 (defun ham-rig--agc-settings ()
   "Return the AGC settings the rig reports, as (VALUE . LABEL), lowest first.
@@ -1807,15 +1950,19 @@ so it is used when it is there, with zero prepended for off.
 AGC is described the same way and read the same way, except that its
 list already carries an off position and needs no zero prepended."
   (let ((name (ham-rig--control-name control)))
-    (if (equal name "AGC")
-        (mapcar #'car (ham-rig--agc-settings))
+    (cond
+     ((ham-rig--control-values control)
+      (mapcar #'car (ham-rig--control-values control)))
+     ((equal name "AGC")
+      (mapcar #'car (ham-rig--agc-settings)))
+     (t
       (let ((line (cond ((equal name "PREAMP") (ham-rig--caps-value "Preamp"))
                         ((equal name "ATT") (ham-rig--caps-value "Attenuator")))))
         (when line
           (let ((values (cl-loop for token in (split-string line "[ \t]+" t)
                                  when (string-match "\\`\\(-?[0-9.]+\\)" token)
                                  collect (string-to-number (match-string 1 token)))))
-            (when values (cons 0 (sort (delete 0 values) #'<)))))))))
+            (when values (cons 0 (sort (delete 0 values) #'<))))))))))
 
 (defun ham-rig--control-value-label (control value)
   "Return a name for VALUE of CONTROL, or nil.
@@ -1824,6 +1971,7 @@ list already carries an off position and needs no zero prepended."
 word for it, then whatever the rig called it."
   (or (cdr (assoc value (cdr (assoc (ham-rig--control-name control)
                                     ham-rig-control-value-labels))))
+      (cdr (assoc value (ham-rig--control-values control)))
       (and (equal (ham-rig--control-name control) "AGC")
            (cdr (assoc value (ham-rig--agc-settings))))))
 
@@ -1874,6 +2022,15 @@ integers as often as to floats and `ftruncate' rejects integers."
       0
     (min 2 (max 1 (ceiling (- (log (ham-rig--control-usable-step control) 10)))))))
 
+(defun ham-rig--format-hz (value)
+  "Return VALUE in hertz, written the way a radio writes a filter.
+Hertz below a kilohertz and kilohertz above it, so 500 and 2.4 k read
+the way they are marked on the radio rather than as 500 and 2400."
+  (if (>= (abs value) 1000)
+      (let ((k (format "%.1f" (/ value 1000.0))))
+        (concat (if (string-suffix-p ".0" k) (substring k 0 -2) k) " kHz"))
+    (format "%d Hz" (round value))))
+
 (defun ham-rig--format-level (control value &optional endpoint)
   "Return VALUE formatted for CONTROL, in whatever unit suits it.
 
@@ -1889,8 +2046,16 @@ the range would label every one of them with the same figure."
          ham-rig--power-watts)
     (format "%d W" (round ham-rig--power-watts)))
    ((ham-rig--control-watts-p control) (format "%d W" (round value)))
-   ((ham-rig--control-discrete-values control)
+   ((eq (ham-rig--control-kind control) 'width)
+    (ham-rig--format-hz value))
+   ;; dB belongs to the preamp and the attenuator, which are what this
+   ;; branch was written for.  Anything else with a list of positions --
+   ;; AGC, a roofing filter, a filter width -- is not in decibels, and
+   ;; labelling it so was wrong the moment there was more than one kind.
+   ((and (ham-rig--control-discrete-values control)
+         (member (ham-rig--control-name control) '("PREAMP" "ATT")))
     (if (zerop value) "off" (format "%d dB" (round value))))
+   ((ham-rig--control-discrete-values control) (format "%d" (round value)))
    ((ham-rig--control-percent-p control) (format "%d%%" (round (* 100 value))))
    ((ham-rig--control-integral-p control) (format "%d" (round value)))
    ;; Emacs `format' has no "%.*f": the precision has to be baked in.
@@ -1918,9 +2083,13 @@ anything about the radio."
 
 (defun ham-rig--control-value (control)
   "Return the cached value of CONTROL, or nil."
-  (if (eq (ham-rig--control-kind control) 'func)
-      (gethash (ham-rig--control-name control) ham-rig--funcs 'unknown)
-    (gethash (ham-rig--control-name control) ham-rig--levels)))
+  (pcase (ham-rig--control-kind control)
+    ('func (gethash (ham-rig--control-name control) ham-rig--funcs 'unknown))
+    ;; The width is already polled and already on the main panel beside
+    ;; the mode.  Reading it from there keeps one copy rather than two
+    ;; that can disagree.
+    ('width (ham-rig-get 'passband))
+    (_ (gethash (ham-rig--control-name control) ham-rig--levels))))
 
 (defun ham-rig--set-control-value (control value)
   "Cache VALUE for CONTROL, marking the panels dirty only if it changed.
@@ -1928,6 +2097,8 @@ anything about the radio."
 Both panels: the transmit meters live in this cache and are drawn on the
 main panel, so marking only the controls panel leaves the bars frozen
 for the whole of a transmission."
+  (when (eq (ham-rig--control-kind control) 'width)
+    (ham-rig--set 'passband value))
   (let* ((func (eq (ham-rig--control-kind control) 'func))
          (table (if func ham-rig--funcs ham-rig--levels))
          (name (ham-rig--control-name control))
@@ -1942,6 +2113,17 @@ for the whole of a transmission."
 (defun ham-rig--read-control (control &optional kind coalesce)
   "Queue a read of CONTROL.  KIND is passed to `ham-rig--enqueue'.
 With COALESCE, supersede any read of the same control already queued."
+  (if (eq (ham-rig--control-kind control) 'width)
+      ;; The width comes back with the mode, so it is the mode that is
+      ;; asked for.
+      (if coalesce
+          (ham-rig--enqueue-latest "m" "m" #'ham-rig--note-mode)
+        (ham-rig--enqueue "m" #'ham-rig--note-mode kind))
+    (ham-rig--read-level-or-func control kind coalesce)))
+
+(defun ham-rig--read-level-or-func (control kind coalesce)
+  "Queue a read of CONTROL, an ordinary level or function.
+KIND and COALESCE are as for `ham-rig--read-control'."
   (let* ((name (ham-rig--control-name control))
          (func (eq (ham-rig--control-kind control) 'func))
          (command (format (if func "u %s" "l %s") name))
@@ -1975,12 +2157,18 @@ With COALESCE, supersede any read of the same control already queued."
       (let ((clamped (max (ham-rig--control-min control)
                           (min (ham-rig--control-max control) value))))
         (ham-rig--set-control-value control clamped)
-        (ham-rig--enqueue-latest
-         (format "L %s" name)
-         (format "L %s %s" name
-                 (if (ham-rig--control-integral-p control)
-                     (format "%d" (round clamped))
-                   (format "%f" clamped))))))
+        (if (eq (ham-rig--control-kind control) 'width)
+            ;; Sent as a mode change, carrying the mode the rig is
+            ;; already in, because that is the only way Hamlib sets it.
+            (when-let ((mode (ham-rig-current-mode)))
+              (ham-rig--enqueue-latest
+               "M" (format "M %s %d" mode (round clamped))))
+          (ham-rig--enqueue-latest
+           (format "L %s" name)
+           (format "L %s %s" name
+                   (if (ham-rig--control-integral-p control)
+                       (format "%d" (round clamped))
+                     (format "%f" clamped)))))))
     ;; Read back what the rig actually accepted, coalesced so that
     ;; holding a key does not queue a confirmation per repeat.
     (ham-rig--read-control control nil t)))
@@ -2039,7 +2227,7 @@ stare at a screen of dashes."
          (line
           (if (eq (ham-rig--control-kind control) 'func)
               (concat
-               (format "  %-14s " (ham-rig--control-label control))
+               (format "  %-18s " (ham-rig--control-label control))
                (pcase value
                  ('unknown (propertize "--" 'face 'ham-rig-label))
                  ('nil (propertize "off" 'face 'ham-rig-label))
@@ -2051,7 +2239,7 @@ stare at a screen of dashes."
                    (span (- max min))
                    (fraction (and value (> span 0) (/ (- value min) (float span)))))
               (concat
-               (format "  %-14s " (ham-rig--control-label control))
+               (format "  %-18s " (ham-rig--control-label control))
                (ham-rig--bar fraction ham-rig-controls-meter-width)
                " "
                (format "%-8s" (ham-rig--format-level control value))
@@ -2083,11 +2271,19 @@ stare at a screen of dashes."
        (propertize "   controls" 'face 'ham-rig-label)
        "\n"
        (let ((levels (cl-remove-if-not
-                      (lambda (c) (eq (ham-rig--control-kind c) 'level))
+                      (lambda (c) (memq (ham-rig--control-kind c)
+                                        '(level width)))
                       controls))
              (funcs (cl-remove-if-not
                      (lambda (c) (eq (ham-rig--control-kind c) 'func))
-                     controls)))
+                     controls))
+             ;; The backend's own, which are the interesting ones: a
+             ;; roofing filter or a contour exists on this radio and not
+             ;; in Hamlib's standard set, so it gets its own heading
+             ;; rather than being filed among the levels every rig has.
+             (ext (cl-remove-if-not
+                   (lambda (c) (eq (ham-rig--control-kind c) 'ext))
+                   controls)))
          (concat
           (if levels
               (concat "\n  " (propertize "LEVELS" 'face 'ham-rig-label) "\n"
@@ -2096,6 +2292,11 @@ stare at a screen of dashes."
           (if funcs
               (concat "\n  " (propertize "FUNCTIONS" 'face 'ham-rig-label) "\n"
                       (mapconcat #'ham-rig--render-control funcs ""))
+            "")
+          (if ext
+              (concat "\n  " (propertize "THIS RADIO" 'face 'ham-rig-label)
+                      "\n"
+                      (mapconcat #'ham-rig--render-control ext ""))
             "")))
        "\n  "
        (propertize "l/r adjust  L/R x10  RET toggle or set  = value  g refresh  q quit"

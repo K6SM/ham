@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.4.0
+;; Version: 0.4.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -773,12 +773,28 @@ The rules, in order:
   no dot, <= 6 digits -- kHz, so 14074 is 14074000 Hz
   no dot, > 6 digits  -- Hz
 
+A trailing Hz, kHz or MHz overrides all of that, so every form
+`ham-format-frequency\=' prints can be read back.
+
 Signals an error if STRING is not a number."
-  (let* ((s (replace-regexp-in-string "[ ,_]" "" (string-trim string)))
+  (let* ((trimmed (string-trim string))
+         (unit (cond ((string-match-p "[ \t]*[kK][hH][zZ]\\'" trimmed) 1000)
+                     ((string-match-p "[ \t]*[mM][hH][zZ]\\'" trimmed) 1000000)
+                     ((string-match-p "[ \t]*[hH][zZ]\\'" trimmed) 1)))
+         (s (replace-regexp-in-string
+             "[ ,_]" ""
+             (if unit
+                 (replace-regexp-in-string "[ \t]*[kKmM]?[hH][zZ]\\'" "" trimmed)
+               trimmed)))
          (dots (cl-count ?. s)))
     (unless (string-match-p "\\`[0-9.]+\\'" s)
       (error "Not a frequency: %s" string))
     (cond
+     ;; A unit that is written down is the one that is meant, whatever
+     ;; the dots suggest.  Without this the panel could print a
+     ;; frequency -- 14074.000 kHz -- that its own prompt then read as
+     ;; 14074 MHz or refused outright.
+     (unit (round (* unit (string-to-number s))))
      ((>= dots 2) (string-to-number (replace-regexp-in-string "\\." "" s)))
      ((= dots 1) (round (* 1000000 (string-to-number s))))
      ((<= (length s) 6) (* 1000 (string-to-number s)))
