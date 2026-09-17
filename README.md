@@ -95,8 +95,9 @@ emulation, which gives you LAN remote operation with wfview carrying the audio.
 | `M-↑` `M-↓` | Tune ten steps (also `PgUp` `PgDn`) |
 | `←` `→` | Smaller / larger step |
 | `.` | Choose a step |
-| `f` | Set frequency: `14074`, `14.074` or `14.074.000` |
-| `m` | Set mode |
+| `f` | Set frequency in kHz: `14074`, or `14.074` MHz, or `14.074.000` |
+| `m` | Set mode; with `C-u`, its filter width too |
+| `w` | Set the filter width |
 | `b` | Change band |
 | `v` | Swap VFO |
 | `s` | Toggle split |
@@ -221,8 +222,14 @@ switches for the tuner, VOX, ANF, APF, manual notch and RIT. A different radio
 gives a different panel.
 
 Read-only meters stay out of this panel. Controls the radio reports with no
-usable range are omitted — on the FTDX10 that is AGC, which takes named
-settings Hamlib does not describe.
+usable range are omitted, unless the rig describes them some other way.
+
+AGC is the case that matters. Hamlib reports it as a level with the range
+`0..0/0`, which looks like nothing to adjust, but it lists the positions
+separately under `AGC levels` — `0=OFF 1=SUPERFAST 2=FAST 5=MEDIUM 3=SLOW
+6=AUTO 4=USER` on a rig with seven. The panel reads that list, so AGC appears
+with the rig's own names for its own positions, and a radio with four gets
+four.
 
 ### Units
 
@@ -247,8 +254,34 @@ Two limits are worth knowing:
   The FTDX10's DNR runs 1 to 15 on the radio; Hamlib presents 0 to 1 in tenths,
   so it reads as a percentage.
 
-Roofing filter and contour are not available: the FTDX10 backend exposes them
-as neither level nor function.
+### Filter width
+
+The receive filter width is not a Hamlib level. It travels with the mode —
+`M <mode> <width>` sets both, `m` reports both — so `w` sends the mode the rig
+last reported along with the new width, and `C-u m` sets the two together.
+
+Completion offers the rig's own filter list where the backend publishes one
+under `Filters`; several backends, the Yaesu ones included, do not, so
+`ham-rig-passband-widths` supplies a sensible set per mode. Any number may be
+typed regardless, and the rig settles on the nearest filter it actually has.
+
+### Roofing filter
+
+Not available, and not for want of trying: **Hamlib has no roofing filter
+level or function at all.** The level flags in `hamlib/rig.h` run out at
+`AGC_TIME`, and nothing in the set names a roofing filter, so there is no
+generic way to reach one — this is a gap in Hamlib rather than in this
+package. Contour is the same.
+
+On a Yaesu the roofing filter is reachable by raw CAT (`RF0;` and friends) if
+you are willing to send rig-specific strings through `rigctl -w`. Nothing here
+does that: a raw command that a backend does not know about can leave Hamlib's
+idea of the radio and the radio itself disagreeing, and this package would
+rather offer a control it can read back.
+
+IF slope tuning is a different matter and does work where the rig reports it:
+`SLOPE_LOW` and `SLOPE_HIGH` are ordinary levels in Hz and appear in the
+controls panel like anything else.
 
 ## Operating remotely
 
@@ -735,6 +768,7 @@ argued about.
 | `ham-rig-meter-units` | comp, VDD, ID | Full scale for normalised meters |
 | `ham-rig-meter-zones` | SWR at 2 and 3 | Where a meter turns amber and red |
 | `ham-rig-controls-exclude` | `nil` | Controls to omit |
+| `ham-rig-passband-widths` | per mode | Filter widths offered where the rig lists none |
 | `ham-rig-poll-when-hidden` | `nil` | Keep polling with no panel visible |
 | `ham-frequency-format` | `dotted` | `14.074.000`, `khz` or `mhz` |
 | `ham-band-default-frequencies` | digital calling | Where `b` moves on each band |

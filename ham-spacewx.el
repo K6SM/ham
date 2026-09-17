@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.15.0
+;; Version: 0.15.1
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -440,10 +440,6 @@ Each value is a plist with `:payload', `:fetched' and `:error'.")
 (defvar ham-spacewx--derived (make-hash-table :test #'equal)
   "Cache of values derived from payloads, keyed by request and generation.")
 
-(defun ham-spacewx--generation-key ()
-  "Return a token identifying the current state of stored data."
-  ham-spacewx--generation)
-
 (defun ham-spacewx--settings-fingerprint ()
   "Return the settings that change how a payload is interpreted.
 Part of every cache key, so adjusting one of these takes effect at
@@ -647,20 +643,6 @@ time in that tail, not in the whole feed."
              (when number (push (cons number (car clock)) pairs)))
            (setq raw (cdr raw) clock (cdr clock)))
          (and pairs (nreverse pairs))))
-     fields)))
-
-(defun ham-spacewx--series (payload fields)
-  "Return the first non-empty numeric series among FIELDS from PAYLOAD.
-FIELDS is a list of candidate names, tried in order.  Works on either
-layout, so a feed that moves between trees keeps reading."
-  (let ((table (ham-spacewx--table-p payload)))
-    (seq-some
-     (lambda (field)
-       (let ((values (ham-spacewx--numbers
-                      (if table
-                          (ham-spacewx--table-column payload field)
-                        (ham-spacewx--record-field payload field)))))
-         (and values values)))
      fields)))
 
 (defun ham-spacewx--number (value)
@@ -990,10 +972,6 @@ has nothing to narrow."
        (or (null energy)
            (string-match-p ham-spacewx-xray-long-band-regexp energy))))
    (ham-spacewx--payload key)))
-
-(defun ham-spacewx--xray-long-band ()
-  "Return the 0.1 to 0.8 nm band records of the six hour feed."
-  (ham-spacewx--xray-long-band-of 'xray))
 
 (defcustom ham-spacewx-xray-floor 1.0e-9
   "Smallest X-ray flux treated as a measurement rather than a gap.

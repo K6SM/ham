@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -131,28 +131,42 @@ keys worth knowing, with the full list left to the help buffer."
           (if hints (concat (ham-note-line hints) "\n") "")
           "\n"))
 
+(defun ham-command-summary (command)
+  "Return the first line of COMMAND's documentation."
+  (let ((doc (documentation command)))
+    (if doc (car (split-string doc "\n")) "")))
+
 (defun ham-key-rows (keymap)
-  "Return (KEY . SUMMARY) for every command bound in KEYMAP, sorted by key."
-  (let (rows)
+  "Return (COMMAND KEY...) for every command bound in KEYMAP.
+
+Grouped by command rather than listed by key.  A panel's aliases -- the
+arrow keys and the page keys doing the same thing, `?\=' and `h\=' both
+opening the help -- otherwise print the same sentence twice over and
+read as a mistake rather than as a choice."
+  (let (commands)
     (map-keymap
      (lambda (event definition)
        (when (commandp definition)
-         (push (cons (key-description (vector event))
-                     (let ((doc (documentation definition)))
-                       (if doc (car (split-string doc "\n")) "")))
-               rows)))
+         (let* ((key (key-description (vector event)))
+                (entry (assq definition commands)))
+           (if entry
+               (setcdr entry (cons key (cdr entry)))
+             (push (cons definition (list key)) commands)))))
      keymap)
+    (dolist (entry commands)
+      (setcdr entry (sort (cdr entry) #'string-lessp)))
     ;; `map-keymap' walks in reverse insertion order, which is no order at
     ;; all to read a key list in.
-    (sort rows (lambda (a b) (string-lessp (car a) (car b))))))
+    (sort commands (lambda (a b) (string-lessp (cadr a) (cadr b))))))
 
 (defun ham-insert-key-table (title keymap)
   "Insert a table of the bindings in KEYMAP under TITLE."
   (insert (propertize (concat title "\n") 'face 'ham-face-heading))
-  (dolist (row (ham-key-rows keymap))
-    (insert (format "%s%-12s %s\n" ham-panel-indent
-                    (propertize (car row) 'face 'ham-face-label)
-                    (cdr row))))
+  (dolist (entry (ham-key-rows keymap))
+    (insert (format "%s%-20s %s\n" ham-panel-indent
+                    (propertize (string-join (cdr entry) ", ")
+                                'face 'ham-face-label)
+                    (ham-command-summary (car entry)))))
   (insert "\n"))
 
 (defun ham-insert-legend (title entries)

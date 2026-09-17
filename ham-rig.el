@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.6
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (ham "0.1.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -785,11 +785,7 @@ also carrying frequency and PTT."
 (defun ham-rig--poll-slow ()
   "Poll mode, VFO, split and, while transmitting, SWR and ALC."
   (when (ham-rig--should-poll-p)
-    (ham-rig--enqueue
-     "m" (lambda (r)
-           (ham-rig--set 'passband (ham-rig--labelled-num r "Passband"))
-           (ham-rig--set 'mode (ham-rig--labelled-val r "Mode")))
-     'poll)
+    (ham-rig--enqueue "m" #'ham-rig--note-mode 'poll)
     (ham-rig--enqueue
      "v" (lambda (r) (ham-rig--set 'vfo (ham-rig--labelled-val r "VFO")))
      'poll)
@@ -1064,8 +1060,13 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
 ;;;; Control commands
 
 (defun ham-rig-set-frequency (hz)
-  "Set the transceiver frequency to HZ.
-Interactively, prompt.  Accepts 14074, 14.074 or 14.074.000."
+  "Set the frequency, read as kHz unless written otherwise.
+
+Interactively, prompt.  A bare number is kHz, so 14074 is the 20 m FT8
+frequency; one dot means MHz, so 14.074 is the same place; two or more
+mean grouped Hz, so 14.074.000 is again the same place.  Above six
+digits with no dot it is taken as Hz.  HZ, when called from Lisp, is
+always in hertz."
   (interactive (list (ham-parse-frequency
                       (read-string "Frequency: " nil nil
                                    (when (ham-rig-frequency)
@@ -1175,10 +1176,94 @@ which is what corrects for a rig that quantises to its own step."
   (ham-rig-tune -10))
 
 (defun ham-rig-set-mode (mode &optional passband)
-  "Set the transceiver to MODE with optional PASSBAND in Hz."
+  "Set the transceiver to MODE, keeping the filter width.
+
+With a prefix argument, also prompt for the width.  PASSBAND is that
+width in Hz; zero, which is what is sent otherwise, tells Hamlib to
+leave the rig on whatever filter the mode already uses."
   (interactive
-   (list (completing-read "Mode: " (ham-rig--available-modes) nil t)))
-  (ham-rig--enqueue (format "M %s %d" mode (or passband 0))))
+   (let ((mode (completing-read "Mode: " (ham-rig--available-modes) nil t)))
+     (list mode (and current-prefix-arg (ham-rig--read-passband mode)))))
+  (ham-rig--enqueue (format "M %s %d" mode (or passband 0)))
+  (ham-rig--enqueue "m" #'ham-rig--note-mode))
+
+(defun ham-rig--note-mode (response)
+  "Record the mode and filter width in RESPONSE."
+  (ham-rig--set 'passband (ham-rig--labelled-num response "Passband"))
+  (ham-rig--set 'mode (ham-rig--labelled-val response "Mode")))
+
+(defcustom ham-rig-passband-widths
+  '(("CW"   . (50 100 200 300 500 800 1200 2400))
+    ("CWR"  . (50 100 200 300 500 800 1200 2400))
+    ("RTTY" . (50 100 200 300 500 800 1200 2400))
+    ("RTTYR" . (50 100 200 300 500 800 1200 2400))
+    ("USB"  . (1500 1800 2000 2400 2600 2800 3000 3200))
+    ("LSB"  . (1500 1800 2000 2400 2600 2800 3000 3200))
+    ("AM"   . (3000 6000 9000))
+    ("FM"   . (9000 12000 15000)))
+  "Filter widths in Hz to offer for each mode, as (MODE . WIDTHS).
+
+Offered for completion only; any number may still be typed, and the rig
+settles on the nearest filter it actually has.  Hamlib reports a rig's
+real filter list under \"Filters\" in its capabilities, and that is used
+in preference to this where the backend provides it -- several,
+including the Yaesu ones, do not."
+  :type '(alist :key-type string :value-type (repeat integer))
+  :group 'ham-rig)
+
+(defun ham-rig--filters-for-mode (mode)
+  "Return the filter widths in Hz the rig reports for MODE, or nil.
+
+Hamlib prints them as lines of \"MODE: width1 width2 ...\" under
+\"Filters\", where a backend supplies them at all."
+  (let ((filters (ham-rig--caps-value "Filters"))
+        (widths nil))
+    (when (and filters mode)
+      (dolist (line (split-string filters "\n" t))
+        (when (string-match
+               (concat "\\_<" (regexp-quote mode) "\\_>[^0-9]*\\(.*\\)") line)
+          (dolist (field (split-string (match-string 1 line) "[ \t,]+" t))
+            (when (string-match-p "\\`[0-9]+\\'" field)
+              (push (string-to-number field) widths))))))
+    (sort (delete-dups widths) #'<)))
+
+(defun ham-rig-passband-choices (&optional mode)
+  "Return the filter widths in Hz worth offering for MODE.
+The rig's own list where it has one, otherwise
+`ham-rig-passband-widths'."
+  (let ((mode (or mode (ham-rig-current-mode))))
+    (or (ham-rig--filters-for-mode mode)
+        (cdr (assoc mode ham-rig-passband-widths))
+        (cdr (assoc (upcase (or mode "")) ham-rig-passband-widths)))))
+
+(defun ham-rig--read-passband (&optional mode)
+  "Prompt for a filter width in Hz for MODE, and return it."
+  (let* ((choices (mapcar #'number-to-string
+                          (ham-rig-passband-choices mode)))
+         (current (ham-rig-get 'passband))
+         (answer (completing-read
+                  (format "Filter width in Hz%s: "
+                          (if current (format " (now %d)" current) ""))
+                  choices nil nil nil nil
+                  (and current (number-to-string current)))))
+    (if (string-match-p "\\`[ \t]*[0-9]+[ \t]*\\'" answer)
+        (string-to-number answer)
+      (user-error "Not a width in Hz: %s" answer))))
+
+;;;###autoload
+(defun ham-rig-set-passband (hz)
+  "Set the receive filter width to HZ, leaving the mode alone.
+
+Hamlib carries the filter width with the mode rather than as a level of
+its own, so the mode has to be sent again to change it.  The mode sent
+is the one the rig last reported, which is why this needs a connection
+that has polled at least once."
+  (interactive (list (ham-rig--read-passband)))
+  (let ((mode (ham-rig-current-mode)))
+    (unless mode
+      (user-error "Mode not known yet.  Connect and let the panel poll once"))
+    (ham-rig--enqueue (format "M %s %d" mode (round hz)))
+    (ham-rig--enqueue "m" #'ham-rig--note-mode)))
 
 (defun ham-rig--available-modes ()
   "Return the mode list reported by the rig, or the fallback list."
@@ -1661,7 +1746,12 @@ leaving it out.  A single-valued range like ATT's 12..12 is different
 and is kept."
   (and (eq (ham-rig--control-kind control) 'level)
        (= (ham-rig--control-min control) (ham-rig--control-max control))
-       (zerop (ham-rig--control-max control))))
+       (zerop (ham-rig--control-max control))
+       ;; Unless the rig described it some other way.  AGC arrives as
+       ;; 0..0/0 and is perfectly settable: what it takes is one of a
+       ;; named set, which Hamlib reports separately.  Dropping it cost
+       ;; an AGC control on every radio that has one.
+       (null (ham-rig--control-discrete-values control))))
 
 (defun ham-rig--readable-levels ()
   "Return the levels the rig can report, meters included."
@@ -1688,26 +1778,54 @@ RFPOWER_METER would otherwise show power twice."
   (let ((name (ham-rig--control-name control)))
     (or (cdr (assoc name ham-rig-control-labels)) name)))
 
+(defun ham-rig--agc-settings ()
+  "Return the AGC settings the rig reports, as (VALUE . LABEL), lowest first.
+
+Hamlib prints them under \"AGC levels\" as `0=OFF 1=SUPERFAST ...\', which
+is the rig saying which of the standard set it actually has and what to
+call each.  Taking them from there rather than from a list written here
+means a radio with four AGC positions gets four and one with seven gets
+seven."
+  (let ((line (ham-rig--caps-value "AGC levels"))
+        (settings nil))
+    (when line
+      (dolist (token (split-string line "[ \t]+" t))
+        (when (string-match "\\`\\([0-9]+\\)=\\(.+\\)\\'" token)
+          (push (cons (string-to-number (match-string 1 token))
+                      (match-string 2 token))
+                settings))))
+    (sort settings (lambda (a b) (< (car a) (car b))))))
+
 (defun ham-rig--control-discrete-values (control)
   "Return the discrete values CONTROL accepts, or nil if it is continuous.
 
 Hamlib describes a preamp or attenuator twice over: as a level with a
 range, and as a list of the switch positions the rig actually has.  The
 list is the truer description -- a preamp is a switch, not a slider --
-so it is used when it is there, with zero prepended for off."
-  (let* ((name (ham-rig--control-name control))
-         (line (cond ((equal name "PREAMP") (ham-rig--caps-value "Preamp"))
-                     ((equal name "ATT") (ham-rig--caps-value "Attenuator")))))
-    (when line
-      (let ((values (cl-loop for token in (split-string line "[ \t]+" t)
-                             when (string-match "\\`\\(-?[0-9.]+\\)" token)
-                             collect (string-to-number (match-string 1 token)))))
-        (when values (cons 0 (sort (delete 0 values) #'<)))))))
+so it is used when it is there, with zero prepended for off.
+
+AGC is described the same way and read the same way, except that its
+list already carries an off position and needs no zero prepended."
+  (let ((name (ham-rig--control-name control)))
+    (if (equal name "AGC")
+        (mapcar #'car (ham-rig--agc-settings))
+      (let ((line (cond ((equal name "PREAMP") (ham-rig--caps-value "Preamp"))
+                        ((equal name "ATT") (ham-rig--caps-value "Attenuator")))))
+        (when line
+          (let ((values (cl-loop for token in (split-string line "[ \t]+" t)
+                                 when (string-match "\\`\\(-?[0-9.]+\\)" token)
+                                 collect (string-to-number (match-string 1 token)))))
+            (when values (cons 0 (sort (delete 0 values) #'<)))))))))
 
 (defun ham-rig--control-value-label (control value)
-  "Return a configured name for VALUE of CONTROL, or nil."
-  (cdr (assoc value (cdr (assoc (ham-rig--control-name control)
-                                ham-rig-control-value-labels)))))
+  "Return a name for VALUE of CONTROL, or nil.
+
+`ham-rig-control-value-labels\=' first, since that is the operator\='s own
+word for it, then whatever the rig called it."
+  (or (cdr (assoc value (cdr (assoc (ham-rig--control-name control)
+                                    ham-rig-control-value-labels))))
+      (and (equal (ham-rig--control-name control) "AGC")
+           (cdr (assoc value (ham-rig--agc-settings))))))
 
 (defun ham-rig--control-watts-p (control)
   "Return non-nil if CONTROL is a level whose unit is watts.
@@ -2143,6 +2261,7 @@ and nothing it cannot."
   "." #'ham-rig-set-tuning-step
   "f" #'ham-rig-set-frequency
   "m" #'ham-rig-set-mode
+  "w" #'ham-rig-set-passband
   "b" #'ham-rig-set-band
   "v" #'ham-rig-toggle-vfo
   "s" #'ham-rig-toggle-split
@@ -2165,6 +2284,7 @@ and nothing it cannot."
   '("Rig"
     ["Set frequency" ham-rig-set-frequency :keys "f"]
     ["Set mode" ham-rig-set-mode :keys "m"]
+    ["Set filter width" ham-rig-set-passband :keys "w"]
     ["Set band" ham-rig-set-band :keys "b"]
     ["Set tuning step" ham-rig-set-tuning-step :keys "."]
     "---"
@@ -2189,29 +2309,36 @@ and nothing it cannot."
     "---"
     ["Bury panel" quit-window :keys "q"]))
 
-(defun ham-rig--keymap-rows (keymap)
-  "Return (KEY . SUMMARY) for every command bound in KEYMAP."
-  (let (rows)
-    (map-keymap
-     (lambda (event definition)
-       (when (commandp definition)
-         (push (cons (key-description (vector event))
-                     (let ((doc (documentation definition)))
-                       (if doc (car (split-string doc "\n")) "")))
-               rows)))
-     keymap)
-    ;; `map-keymap' walks in reverse insertion order, which is no order
-    ;; at all to read a key list in.
-    (sort rows (lambda (a b) (string-lessp (car a) (car b))))))
+(defun ham-rig--bound-commands ()
+  "Return every command reachable from either rig panel's keymap."
+  (let (bound)
+    (dolist (keymap (list ham-rig-mode-map ham-rig-controls-mode-map))
+      (map-keymap (lambda (_event definition)
+                    (when (commandp definition) (push definition bound)))
+                  keymap))
+    bound))
 
-(defun ham-rig--insert-key-table (title keymap)
-  "Insert a table of the bindings in KEYMAP under TITLE."
-  (insert (propertize (concat title "\n") 'face 'bold))
-  (dolist (row (ham-rig--keymap-rows keymap))
-    (insert (format "  %-12s %s\n"
-                    (propertize (car row) 'face 'ham-rig-meter)
-                    (cdr row))))
-  (insert "\n"))
+(defun ham-rig--keyless-commands ()
+  "Return this package's commands that no panel key reaches.
+
+Worked out rather than written down.  The list here was written down,
+and had drifted: six of the commands on it had keys, so the help said
+`M-x ham-rig-connect\=' to an operator who could have pressed `c\='."
+  (let ((bound (ham-rig--bound-commands))
+        (keyless nil))
+    (mapatoms
+     (lambda (symbol)
+       (when (and (commandp symbol)
+                  (string-prefix-p "ham-rig" (symbol-name symbol))
+                  (not (string-match-p "--" (symbol-name symbol)))
+                  ;; A major mode and a menu are commands to Emacs and
+                  ;; not to an operator; neither is a thing to type.
+                  (not (string-suffix-p "-mode" (symbol-name symbol)))
+                  (not (string-suffix-p "-menu" (symbol-name symbol)))
+                  (not (memq symbol bound)))
+         (push symbol keyless))))
+    (sort keyless (lambda (a b) (string-lessp (symbol-name a)
+                                              (symbol-name b))))))
 
 ;;;###autoload
 (defun ham-rig-help ()
@@ -2220,18 +2347,13 @@ and nothing it cannot."
   (with-current-buffer (get-buffer-create "*ham-rig-help*")
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (ham-rig--insert-key-table "Rig panel" ham-rig-mode-map)
-      (ham-rig--insert-key-table "Controls panel" ham-rig-controls-mode-map)
-      (insert (propertize "Commands with no key\n" 'face 'bold))
-      (dolist (command '(ham-rig ham-rig-controls ham-rig-connect
-                                 ham-rig-disconnect ham-rig-power-on
-                                 ham-rig-power-off ham-rig-read-power-state
-                                 ham-rig-set-tuning-step ham-rig-show-stats
-                                 ham-rig-show-capabilities ham-rig-panic-unkey))
+      (ham-insert-key-table "Rig panel" ham-rig-mode-map)
+      (ham-insert-key-table "Controls panel" ham-rig-controls-mode-map)
+      (insert (propertize "Commands with no key, for M-x\n" 'face 'bold))
+      (dolist (command (ham-rig--keyless-commands))
         (insert (format "  %-28s %s\n"
                         (symbol-name command)
-                        (let ((doc (documentation command)))
-                          (if doc (car (split-string doc "\n")) "")))))
+                        (ham-command-summary command))))
       (goto-char (point-min)))
     (special-mode)
     (pop-to-buffer (current-buffer))))
