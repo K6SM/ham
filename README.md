@@ -32,7 +32,9 @@ Everything works in a terminal.
 | `ham-remote.el` | Audio transport for operating over a network. |
 | `ham-spacewx.el` | Space weather, NOAA scales and a propagation estimate. |
 | `ham-spot.el` | Spot list, and the key that tunes the radio to one. |
-| `ham-dxcluster.el` | DX cluster client, the first spot source. |
+| `ham-dxcluster.el` | DX cluster client. |
+| `ham-pota.el` | Parks on the Air activations. |
+| `ham-sota.el` | Summits on the Air activations. |
 
 ## Requirements
 
@@ -633,12 +635,13 @@ on one and press `RET`: the radio tunes to it, in the right mode.
   Spots   14 shown of 31
   RET tune   f filter   b band   s sort   g refresh   c clear   ? keys
 
-  cluster: dxc.nc7j.com, DXSpider  31 spots
+  cluster: dxc.nc7j.com, DXSpider  31 spots   POTA: 24 spots, 40s ago
 
     14074.0 20m  FT8    JR1FYS      12s  dxcluster LOUD in FL!
+    14320.0 20m  SSB    K4ABC       30s  pota      K-1234 Shenandoah NP
      7005.0 40m  CW     VP8ABC      1m   dxcluster up 2
+    14062.0 20m  CW     G0ABC       2m   sota      G/LD-007 Great Gable
     18100.0 17m  FT8    JA1XYZ      3m   dxcluster -12 dB
-    14025.0 20m  CW     K1ABC       7m   dxcluster 599 NH
 ```
 
 | Key | Action |
@@ -652,8 +655,37 @@ on one and press `RET`: the radio tunes to it, in the right mode.
 | `s` | Sort by age, frequency, callsign or source |
 | `a` | How long to keep spots |
 | `g` | Ask every source for an update |
-| `c` | Discard every spot |
+| `c` | Discard spots — this panel's feed only, if it shows one |
+| `1` | One list for every feed |
+| `2` | A window for each feed |
+| `o` | Only this spot's feed |
 | `?` | This list |
+
+### One list, or one window each
+
+`M-x ham-spots` shows every feed in one list, with a column saying where each
+spot came from. `M-x ham-spots-separate` gives each feed a window of its own,
+and `ham-spot-separate-buffers` makes that the default.
+
+```
+  DX cluster   31 shown          │  POTA   24 shown
+  RET tune   f filter   b band … │  RET tune   f filter   b band …
+                                 │
+  cluster: dxc.nc7j.com          │  POTA: 24 spots, 40s ago
+                                 │
+    14074.0 20m  FT8  JR1FYS  12s│    14320.0 20m SSB K4ABC 30s K-1234 Shenandoah
+     7005.0 40m  CW   VP8ABC  1m │     7180.0 40m SSB W1XYZ 2m  K-0055 Acadia NP
+```
+
+Each panel keeps its own filter, sort and cursor position, and `c` clears only
+that feed. A panel showing one feed spends the source column on the park or
+summit name instead, since every row in it would say the same thing.
+
+Worth having when the feeds are being used for different things: a contest
+weekend's cluster produces spots faster than anyone can read, and in a combined
+list it buries the handful of park and summit activations that were the reason
+for looking. `M-x ham-dxcluster`, `M-x ham-pota` and `M-x ham-sota` each open
+just that one.
 
 ### The DX cluster
 
@@ -692,6 +724,48 @@ look when the panel stays empty.
 `M-x ham-dxcluster-spot` posts a spot of your own to the network. It confirms
 first: that one is not undoable and not anonymous.
 
+### Parks and summits
+
+```elisp
+(require 'ham-pota)
+(require 'ham-sota)
+```
+
+Nothing to configure and no account needed — both publish their current
+activations openly. Each is read every two minutes, and never more often than
+once a minute, which is SOTA's published rule and ordinary politeness towards
+POTA.
+
+```elisp
+(setq ham-pota-programs '("K" "VE"))    ; North American parks only
+(setq ham-sota-associations '("W7W"))   ; one SOTA association
+(setq ham-pota-include-rbn nil)         ; people, not skimmers
+```
+
+Canadian Parks on the Air is POTA's `VE` references rather than a separate
+network, so `ham-pota-programs` covers it. WWFF and BOTA are not POTA and still
+need their own back ends.
+
+Three things about these two are worth knowing, because each was a trap:
+
+- **POTA sends kilohertz and SOTA sends megahertz.** Both send the number as a
+  string and neither says which it is. A parser written for one and pointed at
+  the other is wrong by a factor of a thousand.
+- **Both send UTC timestamps with no zone marker.** Read as local time, every
+  spot arrives hours old, ages straight out of the panel, and the panel shows
+  nothing with no indication why.
+- **The old SOTA host still answers.** `api2.sota.org.uk` is retired but
+  returns HTTP 200 with placeholder records saying `DEPRECATED` instead of
+  failing, so a client pointed at it looks like it is working and shows
+  fiction. `ham-sota-host` defaults to `api-db2.sota.org.uk`, and the answer is
+  checked for those placeholders so a stale setting produces a plain error.
+
+Unlike a cluster, these are asked rather than listened to, and each answer is
+the whole current list. So an answer *replaces* what that feed had rather than
+merging into it: an activator who has packed up is simply absent next time, and
+merging would leave them on the panel for an hour looking exactly like somebody
+still calling CQ.
+
 ### The mode a spot shows
 
 A cluster spot is a callsign and a frequency. It almost never carries a mode,
@@ -720,35 +794,48 @@ supplies spots and says how to start and stop itself:
 ```elisp
 (ham-spot-register-feed
  (ham-spot-feed-create
-  :name 'pota :title "POTA"
-  :start #'my-pota-start :stop #'my-pota-stop
-  :live-p #'my-pota-running-p))
+  :name 'wwff :title "WWFF"
+  :start #'my-wwff-start :stop #'my-wwff-stop
+  :live-p #'my-wwff-running-p))
 ```
 
-and hands each spot to `ham-spot-record`, which de-duplicates, ages and
-publishes it:
+There are two ways to deliver spots, and which one a network is decides the
+rest. A network that **pushes** — a cluster, sending one line at a time — hands
+each spot to `ham-spot-record`, which de-duplicates it, ages it and publishes
+it:
 
 ```elisp
 (ham-spot-record
  (ham-spot-fill-mode
   (ham-spot-create :call "K6SM" :hz 14074000 :when (current-time)
-                   :source 'pota :reference "K-1234")))
+                   :source 'wwff :reference "KFF-1234")))
 ```
 
 Two reports of the same station on the same band are one spot, newest winning,
 so the list holds stations rather than the history of everyone who heard them.
 
+A network that is **asked** — an API answering with the whole current list —
+calls `ham-spot-replace-feed` instead, which swaps that feed's spots wholesale
+so departures register as well as arrivals. `ham-spot-poller-create` does the
+asking: give it a URL, a function to read one answer, and an interval, and it
+handles the timer, the one-request-at-a-time rule, the service's own minimum
+interval, and the error reporting. `ham-pota.el` is about a hundred lines
+because of it, and is the one to copy.
+
+`ham-fetch-json` in `ham.el` is underneath both: curl when it is on PATH and
+`url.el` when it is not, asynchronous either way, on every platform.
+
 ### Not yet done
 
-POTA, SOTA, BOTA, WWFF, CanParks, PSK Reporter and DXpeditions are the
-remaining sources. The record and the panel are built for them — a park
-activation carries its reference and the panel shows it — but the fetchers are
-not written yet.
+WWFF, BOTA, PSK Reporter and DXpeditions are the remaining sources. Canadian
+Parks on the Air needs no back end — it is POTA's `VE` references, reachable
+through `ham-pota-programs`.
 
-Note that HamClock, which does have all of these, gets none of them from the
-programs themselves: its server aggregates them into one file that every clock
-downloads. There is no such server here, so each program's own API has to be
-read directly, which is why they are separate pieces of work rather than one.
+Note that HamClock, which has all of these, gets none of them from the programs
+themselves: its own server aggregates them into a single file that every clock
+downloads. There is no such server here, so each program's API is read
+directly — which is why they are separate pieces of work rather than one, and
+why the units and timestamp quirks above had to be found one network at a time.
 
 ## Space weather
 
@@ -944,6 +1031,14 @@ argued about.
 | `ham-spot-max-spots` | `500` | Most spots to hold, however recent |
 | `ham-spot-sort` | `age` | Newest first, or by frequency, call or source |
 | `ham-spot-qsy-sets-mode` | `t` | Whether tuning to a spot sets the mode too |
+| `ham-spot-separate-buffers` | `nil` | Give each feed its own window |
+| `ham-pota-programs` | `nil` | Park programs by reference prefix: `K`, `VE` |
+| `ham-pota-include-rbn` | `t` | Include POTA's Reverse Beacon Network spots |
+| `ham-pota-interval` | `120` | Seconds between reads of POTA |
+| `ham-sota-host` | api-db2 | The SOTA API; not the retired api2 |
+| `ham-sota-associations` | `nil` | SOTA associations to show |
+| `ham-sota-window` | `120` | Minutes of SOTA spots to ask for |
+| `ham-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
 | `ham-spacewx-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
 | `ham-spacewx-panel-width` | `50` | Columns the panel lays itself out to |
 | `ham-spacewx-metric-views` | per reading | Window and width of each sparkline |
@@ -1015,6 +1110,12 @@ arrives with no newline after it — was checked against the same project's
 The band segment table follows the one the DX cluster software publishes in its
 `bands.pl`, corrected where the published tables lag practice: 30 metre FT8 is
 at 10136, not 10131.
+
+Park and summit spots come from
+[Parks on the Air](https://pota.app/) and
+[Summits on the Air](https://www.sota.org.uk/), whose spotting APIs are public
+and read-only. The field names and units were checked against working clients
+of both rather than guessed at.
 
 Space weather data comes from the
 [NOAA Space Weather Prediction Center](https://www.swpc.noaa.gov/), a work of

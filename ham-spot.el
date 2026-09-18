@@ -3,8 +3,8 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (ham "0.5.0"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "29.1") (ham "0.6.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
 
@@ -171,7 +171,14 @@ panel can become slow."
   :group 'ham-spot)
 
 (defvar ham-spot--spots nil
-  "Every spot currently held, newest last.")
+  "Every spot currently held, newest last.
+
+One list for every feed.  A panel showing a single feed filters this
+rather than keeping a list of its own, so a spot is held once however
+many panels are open and cannot go stale in one of them.")
+
+(defvar-local ham-spot--source-filter nil
+  "Feed this buffer shows, or nil for all of them.")
 
 (defvar ham-spot-topic-new 'ham-spot-new
   "Event published with each spot as it is recorded.")
@@ -184,8 +191,13 @@ panel can become slow."
   ham-spot--spots)
 
 (defun ham-spot-clear (&optional source)
-  "Discard stored spots, or only those from SOURCE."
-  (interactive)
+  "Discard stored spots, or only those from SOURCE.
+
+Used in a panel showing one feed, it clears that feed alone: the key
+does what the panel it was pressed in is about, rather than reaching
+over and emptying a cluster the operator cannot even see from here."
+  (interactive (list (and (derived-mode-p 'ham-spots-mode)
+                          ham-spot--source-filter)))
   (setq ham-spot--spots
         (if source
             (seq-remove (lambda (s) (eq (ham-spot-source s) source)) ham-spot--spots)
@@ -244,6 +256,33 @@ whether a report is worth passing on."
         spot)
        (t nil)))))
 
+(defun ham-spot-replace-feed (source spots)
+  "Replace everything held from SOURCE with SPOTS.
+
+The other way a feed delivers.  A cluster pushes one spot at a time and
+each is news, so it calls `ham-spot-record\='.  A program with an API
+answers with the whole current list every time it is asked, and there
+the absences matter as much as the arrivals: an activator who has
+finished is simply no longer in the answer, and merging would leave
+them on the panel until they aged out.  Sixty minutes of a park that is
+no longer being activated is worse than nothing, because it reads
+exactly like one that is.
+
+Returns how many spots were kept."
+  (let ((kept (seq-filter #'ham-spot--acceptable-p spots)))
+    (setq ham-spot--spots
+          (append (seq-remove (lambda (s) (eq (ham-spot-source s) source))
+                              ham-spot--spots)
+                  ;; Oldest first, matching the order the list is held in,
+                  ;; so the newest of a batch is the newest overall.
+                  (sort kept (lambda (a b)
+                               (time-less-p (ham-spot-when a)
+                                            (ham-spot-when b))))))
+    (ham-spot-expire)
+    (ham-publish ham-spot-topic-changed)
+    (ham-spot--schedule-redisplay)
+    (length kept)))
+
 (defun ham-spot--acceptable-p (spot)
   "Return non-nil if SPOT is worth holding at all."
   (and (ham-spot-p spot)
@@ -268,6 +307,100 @@ which is exactly the sort of knowing a program can do."
             (string-empty-p (ham-spot-mode spot)))
     (setf (ham-spot-mode spot) (ham-mode-for-frequency (ham-spot-hz spot))))
   spot)
+
+
+;;;; Polled feeds
+
+;; A cluster pushes and a web service is asked.  The asking is the same
+;; every time -- a timer, one request in flight at a time, the answer
+;; replacing what that feed had -- so it lives here and a back end
+;; supplies only the URL and the way to read one record.
+
+(cl-defstruct (ham-spot-poller (:constructor ham-spot-poller-create)
+                               (:copier nil))
+  "The state of one feed that is polled rather than pushed to.
+
+SOURCE names the feed.  URL is a function returning what to fetch.
+PARSE turns the decoded JSON into a list of spots.  INTERVAL is
+seconds between requests.  MINIMUM is the shortest interval the
+service permits, which is not the same thing: it is a limit set by
+somebody else and is enforced rather than merely defaulted."
+  source url parse interval (minimum 60)
+  timer in-flight last-attempt last-success last-error (count 0))
+
+(defun ham-spot-poller-status (poller title)
+  "Return a status line for POLLER, named TITLE."
+  (cond
+   ((ham-spot-poller-in-flight poller) (format "%s: fetching" title))
+   ((ham-spot-poller-last-error poller)
+    (format "%s: %s" title (ham-spot-poller-last-error poller)))
+   ((ham-spot-poller-last-success poller)
+    (format "%s: %d spots, %s ago" title (ham-spot-poller-count poller)
+            (ham-spot--age-label
+             (floor (float-time (time-subtract
+                                 (current-time)
+                                 (ham-spot-poller-last-success poller)))))))
+   (t (format "%s: not read yet" title))))
+
+(defun ham-spot-poller-due-p (poller)
+  "Return non-nil if POLLER may ask again now.
+
+The minimum is a rule of the service rather than a preference of ours,
+so it is applied to a manual refresh as well.  A key that asks a public
+API faster than it allows is a key that gets an address blocked."
+  (let ((last (ham-spot-poller-last-attempt poller)))
+    (and (not (ham-spot-poller-in-flight poller))
+         (or (null last)
+             (> (float-time (time-subtract (current-time) last))
+                (ham-spot-poller-minimum poller))))))
+
+(defun ham-spot-poller-fetch (poller &optional force)
+  "Ask POLLER's service for the current list.
+FORCE skips the interval but never the service's own minimum."
+  (when (or force (ham-spot-poller-due-p poller))
+    (if (not (ham-spot-poller-due-p poller))
+        (message "ham-spot: %s allows one request every %d seconds"
+                 (ham-spot-poller-source poller)
+                 (ham-spot-poller-minimum poller))
+      (setf (ham-spot-poller-in-flight poller) t
+            (ham-spot-poller-last-attempt poller) (current-time))
+      (ham-fetch-json
+       (funcall (ham-spot-poller-url poller))
+       (lambda (data error)
+         (setf (ham-spot-poller-in-flight poller) nil)
+         (if error
+             (progn
+               (setf (ham-spot-poller-last-error poller) error)
+               (ham-spot--schedule-redisplay))
+           (condition-case err
+               (let ((spots (funcall (ham-spot-poller-parse poller) data)))
+                 (setf (ham-spot-poller-last-error poller) nil
+                       (ham-spot-poller-last-success poller) (current-time)
+                       (ham-spot-poller-count poller)
+                       (ham-spot-replace-feed (ham-spot-poller-source poller)
+                                              spots)))
+             (error
+              (setf (ham-spot-poller-last-error poller)
+                    (format "could not read the answer: %s"
+                            (error-message-string err)))
+              (ham-spot--schedule-redisplay)))))))))
+
+(defun ham-spot-poller-start (poller)
+  "Start POLLER, fetching now and then on its interval."
+  (ham-spot-poller-stop poller)
+  (setf (ham-spot-poller-timer poller)
+        (run-at-time 0 (ham-spot-poller-interval poller)
+                     (lambda () (ham-spot-poller-fetch poller)))))
+
+(defun ham-spot-poller-stop (poller)
+  "Stop POLLER."
+  (when (ham-spot-poller-timer poller)
+    (cancel-timer (ham-spot-poller-timer poller))
+    (setf (ham-spot-poller-timer poller) nil)))
+
+(defun ham-spot-poller-running-p (poller)
+  "Return non-nil if POLLER has a timer armed."
+  (and (ham-spot-poller-timer poller) t))
 
 
 ;;;; Sorting and filtering
@@ -384,9 +517,33 @@ put the cursor on."
 ;;;; The panel
 
 (defcustom ham-spot-buffer-name "*ham-spots*"
-  "Name of the buffer the spot panel draws into."
+  "Name of the buffer the combined spot panel draws into.
+
+A panel showing one feed gets a buffer of its own named after it, so
+that the cluster and the parks can be on screen at once."
   :type 'string
   :group 'ham-spot)
+
+(defcustom ham-spot-separate-buffers nil
+  "Whether `ham-spots\=' opens one window per feed rather than one list.
+
+Combined is the shorter answer to \"who is on the air\", and the source
+column says where each spot came from.  Separate is the better one when
+the feeds are being used for different things -- watching a cluster for
+DX while picking parks off a list -- since each panel then keeps its
+own filter, sort and position, and a busy cluster cannot push the parks
+off the screen."
+  :type 'boolean
+  :group 'ham-spot)
+
+(defun ham-spot-buffer-name (&optional source)
+  "Return the buffer name for the panel showing SOURCE, or the combined one."
+  (if source
+      (format "*ham-spots: %s*"
+              (let ((feed (ham-spot-feed-named source)))
+                (or (and feed (ham-spot-feed-title feed))
+                    (symbol-name source))))
+    ham-spot-buffer-name))
 
 (defcustom ham-spot-comment-width 22
   "Columns given to a spot's comment, or zero to leave it out."
@@ -404,9 +561,6 @@ put the cursor on."
 (defface ham-spot-frequency '((t :inherit ham-face-value))
   "Face for the frequency."
   :group 'ham-spot)
-
-(defvar-local ham-spot--source-filter nil
-  "Source this buffer shows, or nil for all of them.")
 
 (defvar ham-spot--redisplay-timer nil)
 
@@ -445,10 +599,29 @@ redrawing a hundred times for one burst."
    ((< seconds 3600) (format "%dm" (/ seconds 60)))
    (t (format "%dh" (/ seconds 3600)))))
 
-(defun ham-spot--line (spot)
-  "Return the panel line for SPOT."
+(defun ham-spot--detail (spot)
+  "Return what to print after SPOT's age: where it is, or what was said.
+
+A park or summit leads with its reference, because that is what an
+operator writes in the log and what they will be asked for, and follows
+it with the name while there is room.  Everything else has only the
+spotter's comment."
+  (let ((reference (ham-spot-reference spot))
+        (name (ham-spot-reference-name spot))
+        (comment (ham-spot-comment spot)))
+    (cond
+     ((and reference name) (format "%s %s" reference name))
+     (reference reference)
+     (name name)
+     (comment comment)
+     (t ""))))
+
+(defun ham-spot--line (spot &optional with-source)
+  "Return the panel line for SPOT.
+WITH-SOURCE includes the column naming which feed it came from, which a
+panel showing only one feed does not need."
   (let* ((age (ham-spot-age spot))
-         (comment (or (ham-spot-reference spot) (ham-spot-comment spot) ""))
+         (comment (ham-spot--detail spot))
          (source (symbol-name (or (ham-spot-source spot) 'unknown))))
     (concat
      ham-panel-indent
@@ -461,31 +634,72 @@ redrawing a hundred times for one burst."
      " "
      (propertize (format "%-4s" (ham-spot--age-label age))
                  'face (if (< age 60) 'ham-spot-new 'ham-face-note))
-     (propertize (format "%-10s" source) 'face 'ham-face-note)
+     (if with-source
+         (propertize (format "%-10s" source) 'face 'ham-face-note)
+       "")
      (if (> ham-spot-comment-width 0)
-         (propertize (truncate-string-to-width comment ham-spot-comment-width)
+         ;; A panel showing one feed spends the source column on the
+         ;; park or summit instead, which is the thing worth reading.
+         (propertize (truncate-string-to-width
+                      comment (+ ham-spot-comment-width
+                                 (if with-source 0 10)))
                      'face 'ham-face-note)
        ""))))
 
+(defun ham-spot--shown ()
+  "Return the spots to draw here, after this buffer's own feed filter."
+  (seq-filter (lambda (spot)
+                (or (null ham-spot--source-filter)
+                    (eq (ham-spot-source spot) ham-spot--source-filter)))
+              (ham-spot-visible)))
+
+(defun ham-spot--held ()
+  "Return every spot this buffer could show, before filtering."
+  (seq-filter (lambda (spot)
+                (or (null ham-spot--source-filter)
+                    (eq (ham-spot-source spot) ham-spot--source-filter)))
+              (ham-spot-all)))
+
+(defun ham-spot--feed-lines ()
+  "Return a status line for each feed this buffer is showing.
+
+A panel may name a feed that is not registered: a back end that was
+loaded when the buffer was opened and is not loaded now, or spots left
+over from one.  That is a panel with nothing to say about its feed,
+not an error."
+  (seq-filter #'identity
+              (mapcar (lambda (name)
+                        (let ((feed (ham-spot-feed-named name)))
+                          (and feed
+                               (ham-spot-feed-status feed)
+                               (funcall (ham-spot-feed-status feed)))))
+                      (if ham-spot--source-filter
+                          (list ham-spot--source-filter)
+                        (ham-spot-feed-names)))))
+
+(defun ham-spot--title ()
+  "Return what this panel is called."
+  (if ham-spot--source-filter
+      (let ((feed (ham-spot-feed-named ham-spot--source-filter)))
+        (or (and feed (ham-spot-feed-title feed))
+            (symbol-name ham-spot--source-filter)))
+    "Spots"))
+
 (defun ham-spot--header ()
   "Return the panel's opening lines."
-  (let* ((visible (length (ham-spot-visible)))
-         (held (length (ham-spot-all)))
-         (sources (seq-filter #'identity
-                              (mapcar (lambda (name)
-                                        (let ((source (ham-spot-feed-named name)))
-                                          (and (ham-spot-feed-status source)
-                                               (funcall (ham-spot-feed-status source)))))
-                                      (ham-spot-feed-names)))))
+  (let* ((visible (length (ham-spot--shown)))
+         (held (length (ham-spot--held)))
+         (feeds (ham-spot--feed-lines)))
     (concat
      (ham-panel-header
-      (format "Spots   %d shown%s"
+      (format "%s   %d shown%s"
+              (ham-spot--title)
               visible
               (if (= visible held) "" (format " of %d" held)))
       "RET tune   f filter   b band   s sort   g refresh   c clear   ? keys")
-     (if sources
+     (if feeds
          (concat ham-panel-indent
-                 (ham-note-line (string-join sources "   ")) "\n\n")
+                 (ham-note-line (string-join feeds "   ")) "\n\n")
        ""))))
 
 (defun ham-spot-refresh ()
@@ -496,21 +710,17 @@ redrawing a hundred times for one burst."
         (column (current-column)))
     (erase-buffer)
     (insert (ham-spot--header))
-    (let ((spots (seq-filter
-                  (lambda (spot)
-                    (or (null ham-spot--source-filter)
-                        (eq (ham-spot-source spot) ham-spot--source-filter)))
-                  (ham-spot-visible))))
+    (let ((spots (ham-spot--shown)))
       (if (null spots)
           (insert ham-panel-indent
                   (ham-note-line
-                   (if (ham-spot-all)
+                   (if (ham-spot--held)
                        "Nothing matches the current filter."
                      "Waiting for spots."))
                   "\n")
         (dolist (spot spots)
           (let ((start (point)))
-            (insert (ham-spot--line spot) "\n")
+            (insert (ham-spot--line spot (null ham-spot--source-filter)) "\n")
             ;; On the whole line, so the cursor finds the spot wherever
             ;; in the row it happens to sit.
             (put-text-property start (point) 'ham-spot spot)))))
@@ -640,6 +850,9 @@ all publish one."
   "a" #'ham-spot-set-age
   "g" #'ham-spot-refresh-feeds
   "c" #'ham-spot-clear
+  "o" #'ham-spot-show-this-feed
+  "1" #'ham-spots-combined
+  "2" #'ham-spots-separate
   "?" #'ham-spot-help
   "q" #'quit-window)
 
@@ -697,6 +910,10 @@ all publish one."
     ["Refresh" ham-spot-refresh-feeds :keys "g"]
     ["Clear" ham-spot-clear :keys "c"]
     "---"
+    ["One list for every feed" ham-spots-combined :keys "1"]
+    ["A window for each feed" ham-spots-separate :keys "2"]
+    ["Only this spot's feed" ham-spot-show-this-feed :keys "o"]
+    "---"
     ["Explain this panel" ham-spot-help :keys "?"]
     ["Customize" (lambda () (interactive) (customize-group 'ham-spot))]
     "---"
@@ -710,36 +927,97 @@ all publish one."
   (setq-local truncate-lines t)
   (setq-local cursor-type 'box))
 
-;;;###autoload
-(defun ham-spots (&optional source)
-  "Open the spot panel, showing SOURCE only when one is given."
-  (interactive)
-  (let ((buffer (get-buffer-create ham-spot-buffer-name)))
+(defun ham-spot--panel (source)
+  "Return the panel buffer for SOURCE, creating and filling it if need be."
+  (let ((buffer (get-buffer-create (ham-spot-buffer-name source))))
     (with-current-buffer buffer
       (unless (derived-mode-p 'ham-spots-mode) (ham-spots-mode))
       (setq ham-spot--source-filter source)
-      (ham-spot-start-feeds)
       (ham-spot-refresh))
-    (pop-to-buffer buffer)))
+    buffer))
+
+;;;###autoload
+(defun ham-spots (&optional source)
+  "Open the spot panel, showing SOURCE only when one is given.
+
+With no source and `ham-spot-separate-buffers\=' set, opens one window
+per feed instead of one combined list."
+  (interactive)
+  (ham-spot-start-feeds)
+  (if (and (null source) ham-spot-separate-buffers)
+      (ham-spots-separate)
+    (pop-to-buffer (ham-spot--panel source))))
+
+;;;###autoload
+(defun ham-spots-separate ()
+  "Show each feed in a window of its own.
+
+One panel per registered feed, each with its own filter, sort and
+position.  A cluster on a contest weekend produces spots faster than
+anyone can read them, and in a combined list it buries the handful of
+park and summit activations that were the reason for looking."
+  (interactive)
+  (ham-spot-start-feeds)
+  (let ((names (ham-spot-feed-names)))
+    (unless names
+      (user-error "No spot feeds are loaded.  Try (require 'ham-dxcluster)"))
+    (delete-other-windows)
+    (let ((first (ham-spot--panel (car names)))
+          (placed 1)
+          (crowded nil))
+      (switch-to-buffer first)
+      (dolist (name (cdr names))
+        ;; Split the largest window each time, so three feeds divide the
+        ;; frame evenly rather than halving the last one repeatedly.
+        (select-window (get-largest-window))
+        (let ((window (split-window-sensibly)))
+          (if (null window)
+              ;; No room left.  Switching buffers here would put this
+              ;; feed over one already on screen, which looks like the
+              ;; panel losing track of itself; the buffer exists either
+              ;; way and can be switched to by hand.
+              (setq crowded t)
+            (select-window window)
+            (switch-to-buffer (ham-spot--panel name))
+            (setq placed (1+ placed)))))
+      (select-window (get-buffer-window first))
+      (when crowded
+        (message "ham-spot: %d of %d feeds fit; the rest are in buffers"
+                 placed (length names)))
+      placed)))
+
+;;;###autoload
+(defun ham-spots-combined ()
+  "Show every feed's spots in one list."
+  (interactive)
+  (ham-spot-start-feeds)
+  (pop-to-buffer (ham-spot--panel nil)))
+
+(defun ham-spot-show-this-feed ()
+  "Open a panel showing only the feed the spot under the cursor came from."
+  (interactive)
+  (let ((spot (ham-spot-at-point)))
+    (unless spot (user-error "No spot here"))
+    (pop-to-buffer (ham-spot--panel (ham-spot-source spot)))))
 
 (defun ham-spot-start-feeds ()
-  "Start every registered source that is not already running."
+  "Start every registered feed that is not already running."
   (dolist (name (ham-spot-feed-names))
-    (let ((source (ham-spot-feed-named name)))
-      (when (and (ham-spot-feed-start source)
-                 (not (and (ham-spot-feed-live-p source)
-                           (funcall (ham-spot-feed-live-p source)))))
+    (let ((feed (ham-spot-feed-named name)))
+      (when (and (ham-spot-feed-start feed)
+                 (not (and (ham-spot-feed-live-p feed)
+                           (funcall (ham-spot-feed-live-p feed)))))
         (with-demoted-errors "ham-spot: could not start source: %S"
-          (funcall (ham-spot-feed-start source)))))))
+          (funcall (ham-spot-feed-start feed)))))))
 
 (defun ham-spot-stop-feeds ()
-  "Stop every registered source."
+  "Stop every registered feed."
   (interactive)
   (dolist (name (ham-spot-feed-names))
-    (let ((source (ham-spot-feed-named name)))
-      (when (ham-spot-feed-stop source)
+    (let ((feed (ham-spot-feed-named name)))
+      (when (ham-spot-feed-stop feed)
         (with-demoted-errors "ham-spot: could not stop source: %S"
-          (funcall (ham-spot-feed-stop source)))))))
+          (funcall (ham-spot-feed-stop feed)))))))
 
 (provide 'ham-spot)
 ;;; ham-spot.el ends here

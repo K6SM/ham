@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.5.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -53,6 +53,8 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'seq)
+(require 'url-queue)
 
 (defgroup ham nil
   "Amateur radio support for Emacs."
@@ -549,6 +551,185 @@ A newline is appended if STRING does not already end with one."
       (condition-case nil
           (progn (process-send-string (ham-connection-process conn) payload) t)
         (error nil)))))
+
+
+;;;; Reading JSON from a web service
+
+;; Several of these packages read a public JSON endpoint and none of
+;; them may block the editor to do it.  `url.el' is built in and works
+;; everywhere, but its connection setup blocks -- a host that does not
+;; answer freezes Emacs for the length of the operating system's TCP
+;; retry, which is long.  curl as a subprocess does not: the work is
+;; handed to another process and the answer arrives in a sentinel.  So
+;; curl when it is there, `url.el' when it is not, behind one call.
+
+(defcustom ham-fetch-backend 'auto
+  "How to read a web service.
+
+`auto\=' uses curl when it is on PATH and `url.el\=' otherwise.  `curl\=' and
+`url\=' force one or the other.  curl is standard on macOS and Linux and
+has shipped with Windows since 10/1803."
+  :type '(choice (const :tag "curl if available" auto)
+                 (const :tag "Always curl" curl)
+                 (const :tag "Always url.el" url))
+  :group 'ham)
+
+(defcustom ham-fetch-timeout 15
+  "Seconds to allow a web request before giving up on it."
+  :type 'integer
+  :group 'ham)
+
+(defcustom ham-fetch-user-agent
+  (format "ham.el/%s (Emacs %s)" "0.6.0" emacs-version)
+  "How these packages identify themselves to a web service.
+
+Several of the amateur radio services ask that a client say what it is,
+so that an endpoint behaving badly can be traced to the program doing
+it rather than blocked wholesale."
+  :type 'string
+  :group 'ham)
+
+(defun ham--curl ()
+  "Return the curl program to use, or nil to use `url.el'."
+  (pcase ham-fetch-backend
+    ('url nil)
+    ('curl (or (executable-find "curl") "curl"))
+    (_ (executable-find "curl"))))
+
+(defun ham-parse-json (string)
+  "Parse STRING as JSON into alists and lists.
+Signals if STRING is not JSON."
+  (json-parse-string string
+                     :object-type 'alist
+                     :array-type 'list
+                     :null-object nil
+                     :false-object nil))
+
+(defun ham-json-field (object field)
+  "Return FIELD of OBJECT, a parsed JSON object, or nil.
+
+FIELD is matched case insensitively and accepts either a symbol or a
+string key, because the parser interns keys as symbols while a
+hand-written fixture tends to hold strings."
+  (let ((wanted (downcase (format "%s" field))))
+    (cdr (seq-find (lambda (pair)
+                     (and (consp pair)
+                          (string= (downcase (format "%s" (car pair))) wanted)))
+                   object))))
+
+(defun ham-json-string (object field)
+  "Return FIELD of OBJECT as a trimmed string, or nil if absent or empty.
+
+JSON null becomes nil rather than the string \"nil\", which is what
+makes a nullable field usable without checking it twice."
+  (let ((value (ham-json-field object field)))
+    (when (and value (not (eq value :null)))
+      (let ((text (string-trim (format "%s" value))))
+        (unless (string-empty-p text) text)))))
+
+(defun ham-fetch-json (url callback &optional timeout)
+  "Read URL and call CALLBACK with the parsed JSON and an error string.
+
+CALLBACK is called with two arguments, DATA and ERROR, exactly one of
+which is non-nil.  It runs later, not now: nothing here blocks.
+TIMEOUT overrides `ham-fetch-timeout\='."
+  (let ((curl (ham--curl))
+        (seconds (or timeout ham-fetch-timeout)))
+    (condition-case err
+        (if curl
+            (ham--fetch-json-curl curl url callback seconds)
+          (ham--fetch-json-url url callback seconds))
+      (error (funcall callback nil (error-message-string err))))))
+
+(defun ham--fetch-json-deliver (callback body failure)
+  "Parse BODY and hand it to CALLBACK, or report FAILURE.
+
+A body that is not JSON is reported with the beginning of what did
+arrive.  It is usually a login page, a proxy notice or an error in
+HTML, and the first line of it says which."
+  (cond
+   (failure (funcall callback nil failure))
+   ((or (null body) (string-empty-p (string-trim body)))
+    (funcall callback nil "empty response"))
+   (t
+    (condition-case err
+        (funcall callback (ham-parse-json body) nil)
+      (error
+       (funcall callback nil
+                (format "%s -- got: %s" (error-message-string err)
+                        (truncate-string-to-width
+                         (string-trim (substring body 0 (min 200 (length body))))
+                         100 nil nil t))))))))
+
+(defun ham--fetch-json-curl (curl url callback seconds)
+  "Read URL through CURL, calling CALLBACK, allowing SECONDS."
+  (let ((buffer (generate-new-buffer " *ham-fetch*")))
+    (make-process
+     :name "ham-fetch"
+     :buffer buffer
+     :noquery t
+     :connection-type 'pipe
+     :command (list curl "--silent" "--show-error" "--location" "--compressed"
+                    "--max-time" (number-to-string seconds)
+                    "--user-agent" ham-fetch-user-agent
+                    "--write-out" "\nham-fetch-status:%{http_code}"
+                    url)
+     :sentinel
+     (lambda (process _event)
+       (unless (process-live-p process)
+         (let ((body nil) (status nil) (failure nil)
+               (code (process-exit-status process)))
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (goto-char (point-max))
+               (if (re-search-backward "^ham-fetch-status:\\([0-9]+\\)$" nil t)
+                   (setq status (string-to-number (match-string 1))
+                         body (buffer-substring-no-properties
+                               (point-min) (match-beginning 0)))
+                 (setq body (buffer-string))))
+             (kill-buffer buffer))
+           (setq failure
+                 (cond
+                  ((and status (>= status 400)) (format "HTTP %d" status))
+                  ((= code 28) (format "timed out after %ss" seconds))
+                  ((/= code 0) (format "curl exit %d" code))))
+           (ham--fetch-json-deliver callback body failure)))))))
+
+(defun ham--fetch-json-url (url callback seconds)
+  "Read URL through `url.el', calling CALLBACK, allowing SECONDS."
+  (let ((url-queue-timeout seconds)
+        (url-request-extra-headers
+         (list (cons "User-Agent" ham-fetch-user-agent))))
+    (url-queue-retrieve
+     url
+     (lambda (status)
+       (let ((buffer (current-buffer))
+             (failure nil)
+             (body nil))
+         (cond
+          ((plist-get status :error)
+           (setq failure (error-message-string (plist-get status :error))))
+          (t
+           (goto-char (point-min))
+           (let ((http (and (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                            (string-to-number (match-string 1)))))
+             (if (and http (>= http 400))
+                 (setq failure (format "HTTP %d" http))
+               (goto-char (point-min))
+               (when (re-search-forward "\n\n" nil t)
+                 (setq body (buffer-substring-no-properties (point)
+                                                            (point-max))))))))
+         (when (buffer-live-p buffer) (kill-buffer buffer))
+         (ham--fetch-json-deliver callback body failure)))
+     nil t t)
+    ;; `url-queue-retrieve' only puts the request on a queue; what
+    ;; starts it is an idle timer.  An interactive Emacs is idle within
+    ;; milliseconds so this is invisible there, but one running
+    ;; --batch -- a test, a script, a headless station logger -- may
+    ;; never idle at all, and the request then sits in the queue for
+    ;; ever with no error and no callback.  Starting the queue here
+    ;; costs nothing when the timer would have done it anyway.
+    (url-queue-run-queue)))
 
 
 ;;;; Station
