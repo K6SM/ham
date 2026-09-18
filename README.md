@@ -15,6 +15,10 @@ real time solar wind. It reports the NOAA R, S and G scales as they stand and as
 they peaked over the last day, and estimates the maximum usable frequency and
 band conditions for your own location.
 
+**`ham-spot.el`** lists who is on the air, from a DX cluster and in time from
+the activation programs and reporting networks. Put the cursor on a spot, press
+`RET`, and the radio goes there — frequency and mode.
+
 **`ham.el`** is the library underneath: an event bus, an asynchronous line
 transport, Maidenhead and great-circle geodesy, a band plan, and frequency
 parsing and formatting. It has no user interface.
@@ -27,6 +31,8 @@ Everything works in a terminal.
 | `ham-rig.el` | Transceiver panel and controls panel. |
 | `ham-remote.el` | Audio transport for operating over a network. |
 | `ham-spacewx.el` | Space weather, NOAA scales and a propagation estimate. |
+| `ham-spot.el` | Spot list, and the key that tunes the radio to one. |
+| `ham-dxcluster.el` | DX cluster client, the first spot source. |
 
 ## Requirements
 
@@ -618,6 +624,132 @@ gone.** This is the same gap CAT has, made likelier by a longer link. A
 radio-end watchdog is the next piece of work. Until it exists, remote operation
 rests on the transceiver's own transmit timeout — **enable it**.
 
+## Spots
+
+`M-x ham-spots` opens the list of stations that have been heard. Put the cursor
+on one and press `RET`: the radio tunes to it, in the right mode.
+
+```
+  Spots   14 shown of 31
+  RET tune   f filter   b band   s sort   g refresh   c clear   ? keys
+
+  cluster: dxc.nc7j.com, DXSpider  31 spots
+
+    14074.0 20m  FT8    JR1FYS      12s  dxcluster LOUD in FL!
+     7005.0 40m  CW     VP8ABC      1m   dxcluster up 2
+    18100.0 17m  FT8    JA1XYZ      3m   dxcluster -12 dB
+    14025.0 20m  CW     K1ABC       7m   dxcluster 599 NH
+```
+
+| Key | Action |
+| --- | --- |
+| `RET`, `.` | Tune the radio to this spot, frequency and mode |
+| `SPC` | Tune to it, leaving the mode alone |
+| `n`, `p`, `↑`, `↓` | Move |
+| `d` | Everything known about this spot |
+| `f` | Show only spots matching a regexp |
+| `b` | Show only certain bands |
+| `s` | Sort by age, frequency, callsign or source |
+| `a` | How long to keep spots |
+| `g` | Ask every source for an update |
+| `c` | Discard every spot |
+| `?` | This list |
+
+### The DX cluster
+
+```elisp
+(require 'ham-dxcluster)
+(setq ham-dxcluster-call "K6SM")        ; required; there is no default
+(setq ham-dxcluster-host "dxc.nc7j.com")
+(setq ham-dxcluster-port 7373)
+```
+
+`M-x ham-dxcluster` opens the panel and connects. A cluster logs who is on it,
+so it will not connect until `ham-dxcluster-call` is set.
+
+**On Windows this needs nothing installed.** Clusters are always described as
+telnet hosts, and Windows has not shipped an enabled telnet client since XP —
+but telnet to a cluster is a bare TCP socket carrying lines of text, and Emacs
+has opened those on every platform for decades. Nothing here shells out.
+
+A cluster with no filter sends every spot on earth, which on a contest weekend
+is unreadable. Filters are the cluster's own, and go in
+`ham-dxcluster-commands`:
+
+```elisp
+(setq ham-dxcluster-commands
+      '("set/filter band/pass 20,40,17"      ; DXSpider
+        "set/filter dxcc/reject k"))
+```
+
+The three families of cluster software take different commands, so the banner
+is read on connecting to find out which one answered — a Spider wants
+`set/qra`, an AR-Cluster wants `set station grid`, and sending the wrong one
+earns a page of help text or, on one of them, a disconnection.
+`M-x ham-dxcluster-show-log` shows the whole conversation, which is where to
+look when the panel stays empty.
+
+`M-x ham-dxcluster-spot` posts a spot of your own to the network. It confirms
+first: that one is not undoable and not anonymous.
+
+### The mode a spot shows
+
+A cluster spot is a callsign and a frequency. It almost never carries a mode,
+and the operator is still expected to know that 14074 means FT8 — which is
+exactly the sort of knowing a program can do. `ham-band-plan` holds which
+segment of each band is used for what, and the narrowest matching segment wins,
+so 14074 reports as FT8 rather than merely DATA. A comment naming a mode beats
+the guess, since that is a person saying what they actually heard.
+
+Tuning sends the rig's own name for the mode, through `ham-rig-mode-aliases`: a
+spot saying FT8 puts a modern radio in `PKTUSB`, and one with no data mode in
+plain sideband, which is how FT8 worked before the radios grew a setting for
+it. `SSB` resolves to LSB or USB by frequency. A mode the rig does not have
+leaves the mode alone rather than being sent and refused, and
+`ham-spot-qsy-sets-mode` turns the whole thing off.
+
+Tuning also clears RIT, XIT and split first. All three put the radio somewhere
+other than the frequency it was just sent, and the panel would go on reading
+the right number the whole time. `ham-rig-tune-clears-offsets` turns that off.
+
+### Writing another source
+
+`ham-spot.el` holds the record, the list, the panel and the radio. A source
+supplies spots and says how to start and stop itself:
+
+```elisp
+(ham-spot-register-feed
+ (ham-spot-feed-create
+  :name 'pota :title "POTA"
+  :start #'my-pota-start :stop #'my-pota-stop
+  :live-p #'my-pota-running-p))
+```
+
+and hands each spot to `ham-spot-record`, which de-duplicates, ages and
+publishes it:
+
+```elisp
+(ham-spot-record
+ (ham-spot-fill-mode
+  (ham-spot-create :call "K6SM" :hz 14074000 :when (current-time)
+                   :source 'pota :reference "K-1234")))
+```
+
+Two reports of the same station on the same band are one spot, newest winning,
+so the list holds stations rather than the history of everyone who heard them.
+
+### Not yet done
+
+POTA, SOTA, BOTA, WWFF, CanParks, PSK Reporter and DXpeditions are the
+remaining sources. The record and the panel are built for them — a park
+activation carries its reference and the panel shows it — but the fetchers are
+not written yet.
+
+Note that HamClock, which does have all of these, gets none of them from the
+programs themselves: its server aggregates them into one file that every clock
+downloads. There is no such server here, so each program's own API has to be
+read directly, which is why they are separate pieces of work rather than one.
+
 ## Space weather
 
 `M-x ham-spacewx` opens the panel. Nothing needs configuring first; it reads the
@@ -798,9 +930,20 @@ argued about.
 | `ham-rig-controls-exclude` | `nil` | Controls to omit |
 | `ham-rig-passband-ranges` | per mode | Filter width range and step, as (MODE MIN MAX STEP) |
 | `ham-rig-poll-when-hidden` | `nil` | Keep polling with no panel visible |
+| `ham-rig-mode-aliases` | FT8 → PKTUSB, … | What a spot's mode is called on the radio |
+| `ham-rig-tune-clears-offsets` | `t` | Clear RIT, XIT and split when tuning to a spot |
 | `ham-frequency-format` | `dotted` | `14.074.000`, `khz` or `mhz` |
 | `ham-band-default-frequencies` | digital calling | Where `b` moves on each band |
+| `ham-band-plan` | per band | Which segment of a band is used for which mode |
 | `ham-station-grid` | `nil` | Your Maidenhead locator |
+| `ham-dxcluster-call` | `nil` | Callsign to log in to the cluster with |
+| `ham-dxcluster-host`, `-port` | nc7j, 7373 | Which cluster to connect to |
+| `ham-dxcluster-commands` | `nil` | Filters to send once logged in |
+| `ham-dxcluster-backlog-count` | `30` | Recent spots to ask for on connecting |
+| `ham-spot-max-age` | `60` | Minutes before a spot is dropped |
+| `ham-spot-max-spots` | `500` | Most spots to hold, however recent |
+| `ham-spot-sort` | `age` | Newest first, or by frequency, call or source |
+| `ham-spot-qsy-sets-mode` | `t` | Whether tuning to a spot sets the mode too |
 | `ham-spacewx-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
 | `ham-spacewx-panel-width` | `50` | Columns the panel lays itself out to |
 | `ham-spacewx-metric-views` | per reading | Window and width of each sparkline |
@@ -864,7 +1007,14 @@ distance and bearing, `ham-band-for-frequency`, `ham-parse-frequency` and
 ## Credits
 
 The propagation estimate's parameterisation is adapted from
-[OpenHamClock](https://github.com/accius/openhamclock), MIT licensed.
+[OpenHamClock](https://github.com/accius/openhamclock), MIT licensed. The DX
+cluster handling — how to tell the three families of cluster software apart,
+what to ask each one for a backlog, and the detail that the login prompt
+arrives with no newline after it — was checked against the same project's
+`dxcluster.cpp`, which has had far more hours on real clusters than this has.
+The band segment table follows the one the DX cluster software publishes in its
+`bands.pl`, corrected where the published tables lag practice: 30 metre FT8 is
+at 10136, not 10131.
 
 Space weather data comes from the
 [NOAA Space Weather Prediction Center](https://www.swpc.noaa.gov/), a work of
