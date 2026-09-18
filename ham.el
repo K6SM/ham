@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.4.1
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -287,10 +287,16 @@ the whole of it."
 
 (cl-defstruct (ham-connection (:constructor ham--connection-create)
                               (:copier nil))
-  "A line-oriented asynchronous TCP connection."
+  "A line-oriented asynchronous TCP connection.
+
+ON-LINE is called with each complete line.  ON-PARTIAL is called with
+whatever is left over after it, which is normally nothing: it exists
+for servers that prompt without a newline and then wait, where a
+line-oriented reader would sit forever with the question still in the
+buffer.  A DX cluster asking for a callsign is exactly that."
   name host port process
   (pending "")
-  on-line on-status
+  on-line on-partial on-status
   (state 'disconnected)
   (auto-reconnect t)
   (backoff nil)
@@ -328,7 +334,25 @@ the whole of it."
           (with-demoted-errors "ham-connection: line handler error: %S"
             (funcall (ham-connection-on-line conn) line))))
       (setq start (1+ idx)))
-    (setf (ham-connection-pending conn) (substring text start))))
+    (setf (ham-connection-pending conn) (substring text start))
+    ;; Whatever is left is either the beginning of a line still on its
+    ;; way or a prompt that will never be terminated.  The handler
+    ;; cannot tell them apart from one call, so it is given every
+    ;; version as the text grows and decides for itself.
+    (let ((partial (ham-connection-pending conn)))
+      (when (and (ham-connection-on-partial conn)
+                 (not (string-empty-p partial)))
+        (with-demoted-errors "ham-connection: partial handler error: %S"
+          (funcall (ham-connection-on-partial conn) partial))))))
+
+(defun ham-connection-consume-partial (conn)
+  "Discard CONN's unterminated text and return what it was.
+
+Called by an ON-PARTIAL handler that has recognised a prompt and
+answered it, so that the same prompt is not offered again as more
+text arrives behind it."
+  (prog1 (ham-connection-pending conn)
+    (setf (ham-connection-pending conn) "")))
 
 (defun ham--connection-socket-busy-p (conn)
   "Return non-nil if CONN's process is open or still connecting.
@@ -445,15 +469,18 @@ for it would have a panel say it was about to reconnect forever."
     (ham--connection-set-state conn 'disconnected (string-trim event))
     (ham--connection-wait conn (string-trim event)))))
 
-(cl-defun ham-connection-make (&key name host port on-line on-status
+(cl-defun ham-connection-make (&key name host port on-line on-partial on-status
                                     (auto-reconnect t))
   "Create a connection object for HOST and PORT named NAME.
-ON-LINE is called with each complete line received.  ON-STATUS is
-called with a state symbol and an optional detail string.  The
-connection is not opened; call `ham-connection-open'."
+ON-LINE is called with each complete line received.  ON-PARTIAL, when
+given, is called with any text after the last newline, for a server
+that prompts without one.  ON-STATUS is called with a state symbol and
+an optional detail string.  The connection is not opened; call
+`ham-connection-open'."
   (ham--connection-create :name (or name (format "%s:%s" host port))
                           :host host :port port
-                          :on-line on-line :on-status on-status
+                          :on-line on-line :on-partial on-partial
+                          :on-status on-status
                           :auto-reconnect auto-reconnect
                           :backoff ham-reconnect-initial-delay))
 
@@ -704,7 +731,11 @@ Both are Maidenhead locators."
     ("630m"     472000     479000)
     ("160m"    1800000    2000000)
     ("80m"     3500000    4000000)
-    ("60m"     5330500    5406400)
+    ;; 60m is the one band where the allocations genuinely differ rather
+    ;; than merely varying at the edges: five fixed channels in the US,
+    ;; a continuous slice in the UK, and a narrow world allocation from
+    ;; WRC-15.  The span here covers all three, as the docstring says.
+    ("60m"     5250000    5450000)
     ("40m"     7000000    7300000)
     ("30m"    10100000   10150000)
     ("20m"    14000000   14350000)
@@ -743,6 +774,75 @@ to taste."
 (defun ham-band-default-frequency (band)
   "Return the default frequency in Hz for BAND, or nil."
   (cadr (assoc band ham-band-default-frequencies)))
+
+(defcustom ham-band-plan
+  ;; Segment edges follow the plan the DX cluster software publishes in
+  ;; its bands.pl, which is also what HamClock works from, so a mode
+  ;; inferred here matches what the cluster and the map agree on.
+  '(("160m" "CW"    1800000  1840000) ("160m" "DATA"   1838000  1843000)
+    ("160m" "FT8"   1840000  1843000) ("160m" "SSB"    1831000  2000000)
+    ("80m"  "CW"    3500000  3600000) ("80m"  "DATA"   3570000  3619000)
+    ("80m"  "FT8"   3573000  3576000) ("80m"  "FT4"    3575000  3578000)
+    ("80m"  "RTTY"  3580000  3619000) ("80m"  "SSB"    3601000  4000000)
+    ("80m"  "SSTV"  3730000  3740000)
+    ("60m"  "CW"    5258000  5264000) ("60m"  "CW"     5351000  5366000)
+    ("60m"  "FT8"   5357000  5357500) ("60m"  "SSB"    5276000  5410000)
+    ("40m"  "CW"    7000000  7040000) ("40m"  "DATA"   7040000  7100000)
+    ("40m"  "FT4"   7047000  7051000) ("40m"  "FT8"    7074000  7077000)
+    ("40m"  "RTTY"  7040000  7060000) ("40m"  "SSB"    7080000  7300000)
+    ("30m"  "CW"   10100000 10130000) ("30m"  "FT8"   10136000 10139000)
+    ("30m"  "FT4"  10140000 10143000) ("30m"  "RTTY"  10141000 10149000)
+    ("30m"  "DATA" 10130000 10150000)
+    ("20m"  "CW"   14000000 14100000) ("20m"  "DATA"  14070000 14098000)
+    ("20m"  "FT8"  14074000 14077000) ("20m"  "FT4"   14080000 14083000)
+    ("20m"  "RTTY" 14070000 14098000) ("20m"  "SSB"   14101000 14350000)
+    ("20m"  "SSTV" 14225000 14235000)
+    ("17m"  "CW"   18068000 18100000) ("17m"  "FT8"   18100000 18103000)
+    ("17m"  "FT4"  18104000 18107000) ("17m"  "RTTY"  18101000 18108000)
+    ("17m"  "SSB"  18111000 18168000)
+    ("15m"  "CW"   21000000 21150000) ("15m"  "DATA"  21070000 21119000)
+    ("15m"  "FT8"  21074000 21077000) ("15m"  "FT4"   21140000 21143000)
+    ("15m"  "RTTY" 21070000 21119000) ("15m"  "SSB"   21151000 21450000)
+    ("12m"  "CW"   24890000 24930000) ("12m"  "FT8"   24915000 24918000)
+    ("12m"  "FT4"  24919000 24922000) ("12m"  "RTTY"  24920000 24929000)
+    ("12m"  "SSB"  24931000 24990000)
+    ("10m"  "CW"   28000000 28198000) ("10m"  "DATA"  28050000 28149000)
+    ("10m"  "FT8"  28074000 28077000) ("10m"  "FT4"   28180000 28183000)
+    ("10m"  "RTTY" 28050000 28149000) ("10m"  "SSB"   28201000 29299000)
+    ("6m"   "CW"   50000000 50100000) ("6m"   "FT8"   50313000 50316000)
+    ("6m"   "FT4"  50318000 50321000) ("6m"   "DATA"  50300000 50500000)
+    ("6m"   "SSB"  50100000 50400000)
+    ("2m"   "CW"  144000000 144150000) ("2m"  "SSB"  144150000 144400000)
+    ("2m"   "FT8" 144174000 144177000)
+    ("70cm" "CW"  432000000 432100000) ("70cm" "SSB" 432100000 432300000)
+    ("70cm" "FT8" 432174000 432177000))
+  "Segments of each band given over to a mode, as (BAND MODE LOW HIGH) in Hz.
+
+Used to guess the mode of a spot that does not carry one, which most
+do not: a DX cluster spot is a frequency and a callsign, and the
+operator still has to know what to switch the radio to.
+
+The plan is a convention rather than a regulation, and it varies by
+region.  Nothing here authorises a transmission; it only says what the
+frequency is most likely being used for."
+  :type '(repeat (list string string integer integer))
+  :group 'ham)
+
+(defun ham-mode-for-frequency (hz)
+  "Return the mode conventionally used at HZ, or nil.
+
+Where segments overlap the narrowest wins, which is what makes a digital
+watering hole inside a wider data segment report as itself: 14074 is FT8
+and not merely DATA."
+  (let ((best nil)
+        (best-span nil))
+    (dolist (entry ham-band-plan)
+      (pcase-let ((`(,_band ,mode ,low ,high) entry))
+        (when (and (>= hz low) (<= hz high))
+          (let ((span (- high low)))
+            (when (or (null best-span) (< span best-span))
+              (setq best mode best-span span))))))
+    best))
 
 
 ;;;; Frequency formatting and parsing

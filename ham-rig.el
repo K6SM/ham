@@ -1084,6 +1084,108 @@ always in hertz."
                           (when-let ((f (ham-rig--num r "Frequency")))
                             (ham-rig--set 'frequency (round f))))))
 
+(defcustom ham-rig-tune-clears-offsets t
+  "Whether tuning to a spot first undoes what would move you off it.
+
+RIT or XIT left dialled in, or split left on from the last pileup, all
+put the radio somewhere other than the frequency it is being sent to,
+and the operator has no reason to suspect it: the panel reads the right
+number.  Set to nil to leave the rig exactly as it was."
+  :type 'boolean
+  :group 'ham-rig)
+
+(defconst ham-rig--tune-preamble
+  '("S 0 VFOA" "U RIT 0" "J 0" "U XIT 0" "Z 0")
+  "Commands clearing split and any receive or transmit offset.
+
+Split off on VFO A, then RIT and XIT switched off and their offsets
+zeroed.  Both halves matter: a rig that has RIT switched off still
+remembers the offset and applies it again the moment RIT comes back.
+
+The letters are rigctl\='s: S is set_split_vfo, J is set_rit and Z is
+set_xit.  Note that K is set_split_freq_mode, and not, as it looks,
+the partner of J.")
+
+;;;###autoload
+(defun ham-rig-tune-to (hz &optional mode)
+  "Tune the radio to HZ, and to MODE when one is given.
+
+The frequency comes first and the mode second, because a rig that
+changes mode may move the passband under the frequency, and the
+frequency is the part that has to be right.
+
+Unlike `ham-rig-set-frequency\=' this is meant to be called with a
+frequency worked out from something else -- a spot, a band map, a
+schedule -- so it also clears whatever offset was left dialled in.
+Returns non-nil if the commands were queued."
+  (interactive (list (ham-parse-frequency (read-string "Tune to: "))
+                     nil))
+  (unless (ham-rig-connected-p)
+    (user-error "Not connected to rigctld.  M-x ham-rig-connect"))
+  (when ham-rig-tune-clears-offsets
+    (dolist (command ham-rig--tune-preamble)
+      (ham-rig--enqueue command)))
+  (ham-rig-set-frequency hz)
+  (when (and mode (not (string-empty-p mode)))
+    ;; The mode is resolved against where the radio is going, not where
+    ;; it is: tuning from 20 m to 40 m and asking for SSB means LSB, and
+    ;; the frequency the rig reports has not caught up yet.
+    (let ((known (ham-rig--tune-mode mode hz)))
+      (if known
+          (ham-rig-set-mode known)
+        (message "ham-rig: %s is not a mode this rig offers" mode))))
+  t)
+
+(defcustom ham-rig-mode-aliases
+  '(("FT8" . "PKTUSB") ("FT4" . "PKTUSB") ("JT65" . "PKTUSB")
+    ("JS8" . "PKTUSB") ("DATA" . "PKTUSB") ("DIGI" . "PKTUSB")
+    ("PSK" . "PKTUSB") ("PSK31" . "PKTUSB") ("MFSK" . "PKTUSB")
+    ("OLIVIA" . "PKTUSB") ("SSTV" . "USB") ("RTTY" . "RTTY")
+    ("PHONE" . "SSB") ("LSB" . "LSB") ("USB" . "USB") ("CW" . "CW")
+    ("AM" . "AM") ("FM" . "FM"))
+  "What a spot's mode is called on the radio, as (SPOT . RIG).
+
+A spot says FT8 and Hamlib has never heard of it: what the rig needs is
+its data mode, which is `PKTUSB\=' on most modern transceivers.  An entry
+whose right hand side the rig does not offer is skipped, so a radio with
+no packet mode simply stays where it is rather than being sent
+something it will refuse.
+
+`SSB\=' is resolved to LSB or USB by frequency, since no radio has a mode
+called SSB."
+  :type '(alist :key-type string :value-type string)
+  :group 'ham-rig)
+
+(defun ham-rig--sideband (&optional hz)
+  "Return the sideband convention at HZ, or at the current frequency.
+
+Below 10 MHz is lower and above it is upper.  A spot that says SSB on
+40 metres means LSB, and a rig put on USB there hears nothing."
+  (let ((hz (or hz (ham-rig-frequency))))
+    (if (and hz (< hz 10000000)) "LSB" "USB")))
+
+(defun ham-rig--tune-mode (mode &optional hz)
+  "Return the rig's name for MODE at HZ, or nil if it has none."
+  (let* ((wanted (upcase (string-trim mode)))
+         (mapped (or (cdr (assoc wanted ham-rig-mode-aliases)) wanted))
+         (available (ham-rig--available-modes)))
+    (when (equal mapped "SSB")
+      (setq mapped (ham-rig--sideband hz)))
+    (cond
+     ((member mapped available) mapped)
+     ;; A data mode the rig spells differently.  PKTUSB, PKTLSB, DIGI,
+     ;; USB-D: whichever of them this rig has is the one to use.
+     ((and (member mapped '("PKTUSB" "PKTLSB"))
+           (seq-find (lambda (m) (string-match-p "PKT\\|DIG\\|DATA" m)) available)))
+     ;; A rig with no data mode at all still works FT8 perfectly well:
+     ;; the sound card does the work and the radio is simply on
+     ;; sideband, which is how everyone did it before the rigs grew a
+     ;; separate setting for it.
+     ((member mapped '("PKTUSB" "PKTLSB"))
+      (let ((sideband (ham-rig--sideband hz)))
+        (and (member sideband available) sideband)))
+     (t nil))))
+
 (defun ham-rig--supersede (match)
   "Drop queued requests that MATCH supersedes.
 
