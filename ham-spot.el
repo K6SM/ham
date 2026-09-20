@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1") (ham "0.6.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -177,9 +177,6 @@ One list for every feed.  A panel showing a single feed filters this
 rather than keeping a list of its own, so a spot is held once however
 many panels are open and cannot go stale in one of them.")
 
-(defvar-local ham-spot--source-filter nil
-  "Feed this buffer shows, or nil for all of them.")
-
 (defvar ham-spot-topic-new 'ham-spot-new
   "Event published with each spot as it is recorded.")
 
@@ -197,7 +194,7 @@ Used in a panel showing one feed, it clears that feed alone: the key
 does what the panel it was pressed in is about, rather than reaching
 over and emptying a cluster the operator cannot even see from here."
   (interactive (list (and (derived-mode-p 'ham-spots-mode)
-                          ham-spot--source-filter)))
+                          (ham-spot--source))))
   (setq ham-spot--spots
         (if source
             (seq-remove (lambda (s) (eq (ham-spot-source s) source)) ham-spot--spots)
@@ -403,14 +400,21 @@ FORCE skips the interval but never the service's own minimum."
   (and (ham-spot-poller-timer poller) t))
 
 
-;;;; Sorting and filtering
+;;;; What one panel is showing
+
+;; Every panel has its own view: which feed, which bands, which modes,
+;; what it is sorted by.  Held per buffer rather than globally, so two
+;; panels on screen are two independent things -- filtering the parks
+;; to 20 metres has no business touching the cluster beside it.  The
+;; settings below are the defaults a new panel starts from, not the
+;; state it goes on using.
 
 (defcustom ham-spot-sort 'age
-  "How the panel orders spots.
+  "How a new panel orders spots.
 
-`age\=' puts the newest first, which is the order they arrive in and the
-one to watch a band in.  `frequency\=' groups them as they sit on the
-dial.  `call\=' and `source\=' are alphabetical."
+`age\=' puts the newest first, whatever feed it came from.  `frequency\='
+groups them as they sit on the dial.  `call\=' and `source\=' are
+alphabetical."
   :type '(choice (const :tag "Newest first" age)
                  (const :tag "By frequency" frequency)
                  (const :tag "By callsign" call)
@@ -418,7 +422,7 @@ dial.  `call\=' and `source\=' are alphabetical."
   :group 'ham-spot)
 
 (defcustom ham-spot-filter nil
-  "A regexp every shown spot must match, or nil for all of them.
+  "A regexp a new panel requires every shown spot to match.
 
 Matched against the callsign, the mode, the band, the spotter, the
 reference and the comment together, so \"POTA\" or \"K-1\" or \"FT8\"
@@ -426,13 +430,84 @@ or \"20m\" all narrow the list to the obvious thing."
   :type '(choice (const :tag "Everything" nil) regexp)
   :group 'ham-spot)
 
+(defcustom ham-spot-exclude nil
+  "A regexp a new panel hides every matching spot for.
+
+The other half of the filter, and the one that gets more use: a station
+calling on the same frequency all evening, or a mode not being worked
+today, is easier to name than everything else is."
+  :type '(choice (const :tag "Nothing" nil) regexp)
+  :group 'ham-spot)
+
 (defcustom ham-spot-bands nil
-  "Bands to show, or nil for all of them."
+  "Bands a new panel shows, or nil for all of them."
   :type '(choice (const :tag "All bands" nil) (repeat string))
   :group 'ham-spot)
 
+(defcustom ham-spot-modes nil
+  "Modes a new panel shows, or nil for all of them.
+
+Names from `ham-spot-mode-groups\=' select a whole family, so \"SSB\"
+covers USB and LSB as well.  Any other name matches only itself."
+  :type '(choice (const :tag "All modes" nil) (repeat string))
+  :group 'ham-spot)
+
+(defcustom ham-spot-mode-groups
+  '(("CW"    "CW" "CWR" "A1A")
+    ("SSB"   "SSB" "USB" "LSB" "PHONE")
+    ("PHONE" "SSB" "USB" "LSB" "AM" "FM")
+    ("DATA"  "DATA" "DIGI" "FT8" "FT4" "JS8" "JT65" "JT9" "Q65" "RTTY"
+     "PSK" "PSK31" "MFSK" "OLIVIA" "CONTESTIA" "WSPR" "PKTUSB" "PKTLSB")
+    ("AM"    "AM")
+    ("FM"    "FM")
+    ("SSTV"  "SSTV"))
+  "Families of mode, as (NAME MODE...).
+
+An operator thinks in families -- phone and CW today, nothing digital
+-- while a spot carries whatever its network happened to call the
+mode.  Asking for SSB should find a spot marked USB, and asking for
+DATA should find FT8; asking for FT8 should find only FT8.
+
+A name that is not a family here matches itself and nothing else, so a
+mode this list has never heard of is still selectable."
+  :type '(alist :key-type string :value-type (repeat string))
+  :group 'ham-spot)
+
+(cl-defstruct (ham-spot-view (:constructor ham-spot-view-create)
+                             (:copier ham-spot-view-copy))
+  "What one panel is showing: its feed, its filters and its order.
+
+SOURCE is the feed this panel is limited to, or nil for all of them.
+AGE is how many minutes back to show, or nil for everything held."
+  source text exclude bands modes (sort 'age) age)
+
+(defvar-local ham-spot--view nil
+  "This panel's view, or nil before one has been made.")
+
+(defun ham-spot-default-view (&optional source)
+  "Return the default view for a new panel showing SOURCE."
+  (ham-spot-view-create :source source
+                        :text ham-spot-filter
+                        :exclude ham-spot-exclude
+                        :bands ham-spot-bands
+                        :modes ham-spot-modes
+                        :sort ham-spot-sort))
+
+(defun ham-spot-view ()
+  "Return this buffer's view.
+
+A panel owns its view and keeps it, which is what makes two panels
+independent.  Anywhere else -- a caller asking what is visible, a
+test -- there is nothing to own it, so a fresh default is built each
+time and follows the settings as they stand rather than freezing them
+at whatever they were the first time somebody asked."
+  (if (derived-mode-p 'ham-spots-mode)
+      (or ham-spot--view
+          (setq ham-spot--view (ham-spot-default-view)))
+    (ham-spot-default-view)))
+
 (defun ham-spot--searchable (spot)
-  "Return the text of SPOT that `ham-spot-filter' is matched against."
+  "Return the text of SPOT that a filter regexp is matched against."
   (string-join
    (delq nil (list (ham-spot-call spot)
                    (ham-spot-mode spot)
@@ -444,29 +519,60 @@ or \"20m\" all narrow the list to the obvious thing."
                    (ham-spot-comment spot)))
    " "))
 
-(defun ham-spot-visible ()
-  "Return the spots the panel should show, in order.
+(defun ham-spot-mode-family (name)
+  "Return every mode the name NAME stands for.
 
-Filtered and sorted, and never longer than the list itself: this is
-what is drawn, and it is rebuilt from `ham-spot-all\=' rather than kept
-alongside it, so a filter can never hold onto a spot that has aged
-out."
-  (let ((spots (seq-filter
-                (lambda (spot)
-                  (and (not (ham-spot--expired-p spot))
-                       (or (null ham-spot-bands)
-                           (member (ham-spot-band spot) ham-spot-bands))
-                       (or (null ham-spot-filter)
-                           (let ((case-fold-search t))
-                             (string-match-p ham-spot-filter
-                                             (ham-spot--searchable spot))))))
-                ham-spot--spots)))
-    (ham-spot-sorted spots)))
+A family name from `ham-spot-mode-groups\=' returns its whole family;
+anything else returns just itself."
+  (let ((family (assoc-string name ham-spot-mode-groups t)))
+    (if family (cdr family) (list name))))
 
-(defun ham-spot-sorted (spots)
-  "Return SPOTS in `ham-spot-sort' order."
+(defun ham-spot-mode-matches-p (mode wanted)
+  "Return non-nil if MODE is among the modes named by WANTED.
+
+WANTED is a list of names, each either a family or a mode.  A spot with
+no mode at all is shown: it is a station on a frequency, and hiding it
+because nobody said what it was doing there loses real spots."
+  (or (null wanted)
+      (null mode)
+      (string-empty-p mode)
+      (seq-some (lambda (name)
+                  (seq-some (lambda (member) (string-equal-ignore-case mode member))
+                            (ham-spot-mode-family name)))
+                wanted)))
+
+(defun ham-spot-view-matches-p (view spot)
+  "Return non-nil if SPOT belongs in VIEW."
+  (and (not (ham-spot--expired-p spot))
+       (or (null (ham-spot-view-source view))
+           (eq (ham-spot-source spot) (ham-spot-view-source view)))
+       (or (null (ham-spot-view-age view))
+           (<= (ham-spot-age spot) (* 60 (ham-spot-view-age view))))
+       (or (null (ham-spot-view-bands view))
+           (member (ham-spot-band spot) (ham-spot-view-bands view)))
+       (ham-spot-mode-matches-p (ham-spot-mode spot) (ham-spot-view-modes view))
+       (let ((case-fold-search t)
+             (text (ham-spot--searchable spot)))
+         (and (or (null (ham-spot-view-text view))
+                  (string-match-p (ham-spot-view-text view) text))
+              (or (null (ham-spot-view-exclude view))
+                  (not (string-match-p (ham-spot-view-exclude view) text)))))))
+
+(defun ham-spot-visible (&optional view)
+  "Return the spots VIEW should show, in order.
+
+Filtered and sorted, and rebuilt from `ham-spot-all\=' every time rather
+than kept alongside it, so a filter can never hold onto a spot that has
+aged out.  VIEW defaults to this buffer's."
+  (let ((view (or view (ham-spot-view))))
+    (ham-spot-sorted (seq-filter (lambda (spot) (ham-spot-view-matches-p view spot))
+                                 ham-spot--spots)
+                     (ham-spot-view-sort view))))
+
+(defun ham-spot-sorted (spots &optional order)
+  "Return SPOTS in ORDER, which defaults to `ham-spot-sort'."
   (let ((copy (copy-sequence spots)))
-    (pcase ham-spot-sort
+    (pcase (or order ham-spot-sort)
       ('frequency (sort copy (lambda (a b) (< (ham-spot-hz a) (ham-spot-hz b)))))
       ('call (sort copy (lambda (a b) (string-lessp (or (ham-spot-call a) "")
                                                     (or (ham-spot-call b) "")))))
@@ -474,9 +580,18 @@ out."
                             (string-lessp
                              (symbol-name (or (ham-spot-source a) 'unknown))
                              (symbol-name (or (ham-spot-source b) 'unknown))))))
-      ;; Newest first, which is the reverse of the order they are held
-      ;; in.  Held oldest first because that is the order they arrive.
-      (_ (nreverse copy)))))
+      ;; Newest first, by what each spot says its time is.
+      ;;
+      ;; This used to reverse the held list instead, on the assumption
+      ;; that spots are held in the order they happened.  They are not:
+      ;; a polled feed replaces its spots as a block, so a POTA answer
+      ;; carrying half an hour of activations landed at the end of the
+      ;; list and sorted as though all of it were newer than everything
+      ;; the cluster had said.  The panel came out in blocks, one per
+      ;; feed, which is exactly what a list sorted by age should never
+      ;; look like.
+      (_ (sort copy (lambda (a b) (time-less-p (ham-spot-when b)
+                                               (ham-spot-when a))))))))
 
 
 ;;;; Turning the radio to a spot
@@ -646,19 +761,21 @@ panel showing only one feed does not need."
                      'face 'ham-face-note)
        ""))))
 
+(defun ham-spot--source ()
+  "Return the feed this panel is limited to, or nil."
+  (ham-spot-view-source (ham-spot-view)))
+
 (defun ham-spot--shown ()
-  "Return the spots to draw here, after this buffer's own feed filter."
-  (seq-filter (lambda (spot)
-                (or (null ham-spot--source-filter)
-                    (eq (ham-spot-source spot) ham-spot--source-filter)))
-              (ham-spot-visible)))
+  "Return the spots to draw here, filtered and ordered by this view."
+  (ham-spot-visible (ham-spot-view)))
 
 (defun ham-spot--held ()
-  "Return every spot this buffer could show, before filtering."
-  (seq-filter (lambda (spot)
-                (or (null ham-spot--source-filter)
-                    (eq (ham-spot-source spot) ham-spot--source-filter)))
-              (ham-spot-all)))
+  "Return every spot this panel could show, before its filters."
+  (let ((source (ham-spot--source)))
+    (seq-filter (lambda (spot)
+                  (and (not (ham-spot--expired-p spot))
+                       (or (null source) (eq (ham-spot-source spot) source))))
+                (ham-spot-all))))
 
 (defun ham-spot--feed-lines ()
   "Return a status line for each feed this buffer is showing.
@@ -673,34 +790,62 @@ not an error."
                           (and feed
                                (ham-spot-feed-status feed)
                                (funcall (ham-spot-feed-status feed)))))
-                      (if ham-spot--source-filter
-                          (list ham-spot--source-filter)
+                      (if (ham-spot--source)
+                          (list (ham-spot--source))
                         (ham-spot-feed-names)))))
 
 (defun ham-spot--title ()
   "Return what this panel is called."
-  (if ham-spot--source-filter
-      (let ((feed (ham-spot-feed-named ham-spot--source-filter)))
-        (or (and feed (ham-spot-feed-title feed))
-            (symbol-name ham-spot--source-filter)))
-    "Spots"))
+  (let ((source (ham-spot--source)))
+    (if source
+        (let ((feed (ham-spot-feed-named source)))
+          (or (and feed (ham-spot-feed-title feed))
+              (symbol-name source)))
+      "Spots")))
+
+(defun ham-spot-view-description (view)
+  "Return what VIEW is filtering on, as a short string, or nil.
+
+A filter set an hour ago and forgotten looks exactly like a quiet band,
+so a panel that is hiding anything says what."
+  (let ((parts (delq nil
+                     (list (when (ham-spot-view-bands view)
+                             (string-join (ham-spot-view-bands view) " "))
+                           (when (ham-spot-view-modes view)
+                             (string-join (ham-spot-view-modes view) " "))
+                           (when (ham-spot-view-age view)
+                             (format "last %d min" (ham-spot-view-age view)))
+                           (when (ham-spot-view-text view)
+                             (format "/%s/" (ham-spot-view-text view)))
+                           (when (ham-spot-view-exclude view)
+                             (format "not /%s/" (ham-spot-view-exclude view)))
+                           (unless (eq (ham-spot-view-sort view) 'age)
+                             (format "by %s" (ham-spot-view-sort view)))))))
+    (when parts (string-join parts "   "))))
 
 (defun ham-spot--header ()
   "Return the panel's opening lines."
   (let* ((visible (length (ham-spot--shown)))
          (held (length (ham-spot--held)))
-         (feeds (ham-spot--feed-lines)))
+         (feeds (ham-spot--feed-lines))
+         (filters (ham-spot-view-description (ham-spot-view))))
     (concat
      (ham-panel-header
       (format "%s   %d shown%s"
               (ham-spot--title)
               visible
               (if (= visible held) "" (format " of %d" held)))
-      "RET tune   f filter   b band   s sort   g refresh   c clear   ? keys")
+      "RET tune  f filter  m mode  b band  s sort  F clear filters  ? keys")
      (if feeds
          (concat ham-panel-indent
-                 (ham-note-line (string-join feeds "   ")) "\n\n")
-       ""))))
+                 (ham-note-line (string-join feeds "   ")) "\n")
+       "")
+     (if filters
+         (concat ham-panel-indent
+                 (propertize "showing " 'face 'ham-face-note)
+                 (propertize filters 'face 'ham-face-label) "\n")
+       "")
+     (if (or feeds filters) "\n" ""))))
 
 (defun ham-spot-refresh ()
   "Redraw this panel from the current list."
@@ -720,7 +865,7 @@ not an error."
                   "\n")
         (dolist (spot spots)
           (let ((start (point)))
-            (insert (ham-spot--line spot (null ham-spot--source-filter)) "\n")
+            (insert (ham-spot--line spot (null (ham-spot--source))) "\n")
             ;; On the whole line, so the cursor finds the spot wherever
             ;; in the row it happens to sit.
             (put-text-property start (point) 'ham-spot spot)))))
@@ -742,38 +887,114 @@ not an error."
   (interactive)
   (forward-line -1))
 
+;; Every one of these changes this panel and no other.  Two windows
+;; side by side are two views, and narrowing the parks to 20 metres
+;; leaves the cluster beside it showing everything.
+
+(defun ham-spot--blank-p (text)
+  "Return non-nil if TEXT is empty or only whitespace."
+  (or (null text) (string-empty-p (string-trim text))))
+
 (defun ham-spot-set-filter (regexp)
-  "Show only spots matching REGEXP, or everything if it is empty."
-  (interactive (list (read-string "Show spots matching: " ham-spot-filter)))
-  (setq ham-spot-filter (if (string-empty-p (string-trim regexp)) nil regexp))
+  "Show only spots matching REGEXP, in this panel.
+An empty REGEXP shows everything again."
+  (interactive (list (read-string "Show spots matching: "
+                                  (ham-spot-view-text (ham-spot-view)))))
+  (setf (ham-spot-view-text (ham-spot-view))
+        (unless (ham-spot--blank-p regexp) regexp))
+  (ham-spot-refresh))
+
+(defun ham-spot-set-exclude (regexp)
+  "Hide spots matching REGEXP, in this panel.  Empty hides none."
+  (interactive (list (read-string "Hide spots matching: "
+                                  (ham-spot-view-exclude (ham-spot-view)))))
+  (setf (ham-spot-view-exclude (ham-spot-view))
+        (unless (ham-spot--blank-p regexp) regexp))
   (ham-spot-refresh))
 
 (defun ham-spot-set-bands (bands)
-  "Show only BANDS, a list of band names, or all bands if empty."
+  "Show only BANDS in this panel, or all bands if empty."
   (interactive
    (list (completing-read-multiple
           "Bands (empty for all): "
           (mapcar #'car ham-bands) nil t
-          (and ham-spot-bands (string-join ham-spot-bands ",")))))
-  (setq ham-spot-bands (and bands (delete "" bands)))
+          (let ((current (ham-spot-view-bands (ham-spot-view))))
+            (and current (string-join current ","))))))
+  (setf (ham-spot-view-bands (ham-spot-view))
+        (let ((wanted (delete "" (or bands nil))))
+          (and wanted wanted)))
+  (ham-spot-refresh))
+
+(defun ham-spot--mode-candidates ()
+  "Return the mode names worth offering.
+
+The families first, then whatever modes the spots actually carry: the
+families are how an operator asks for phone or digital, and the rest is
+whatever the networks happen to be reporting today."
+  (delete-dups
+   (append (mapcar #'car ham-spot-mode-groups)
+           (sort (delq nil (delete-dups (mapcar #'ham-spot-mode
+                                                (ham-spot-all))))
+                 #'string-lessp))))
+
+(defun ham-spot-set-modes (modes)
+  "Show only MODES in this panel, or every mode if empty.
+
+A family name shows the whole family, so SSB covers USB and LSB and
+DATA covers FT8, RTTY and the rest.  Any other name matches only
+itself, so FT8 means FT8."
+  (interactive
+   (list (completing-read-multiple
+          "Modes (empty for all): "
+          (ham-spot--mode-candidates) nil nil
+          (let ((current (ham-spot-view-modes (ham-spot-view))))
+            (and current (string-join current ","))))))
+  (setf (ham-spot-view-modes (ham-spot-view))
+        (let ((wanted (delete "" (or modes nil))))
+          (and wanted (mapcar #'upcase wanted))))
   (ham-spot-refresh))
 
 (defun ham-spot-set-sort (order)
-  "Order the panel by ORDER."
+  "Order this panel by ORDER."
   (interactive
    (list (intern (completing-read "Sort by: "
                                   '("age" "frequency" "call" "source")
                                   nil t nil nil
-                                  (symbol-name ham-spot-sort)))))
-  (setq ham-spot-sort order)
+                                  (symbol-name (ham-spot-view-sort
+                                                (ham-spot-view)))))))
+  (setf (ham-spot-view-sort (ham-spot-view)) order)
   (ham-spot-refresh))
 
 (defun ham-spot-set-age (minutes)
-  "Keep spots for MINUTES."
-  (interactive (list (read-number "Keep spots for how many minutes: "
-                                  ham-spot-max-age)))
-  (setq ham-spot-max-age minutes)
-  (ham-spot-expire)
+  "Show only spots from the last MINUTES in this panel.
+
+Zero, or a number at least as large as `ham-spot-max-age\=', shows
+everything held.  The store keeps `ham-spot-max-age\=' minutes for every
+panel, so asking one panel for more than that shows no more: it is said
+rather than silently ignored."
+  (interactive (list (read-number "Show spots from the last how many minutes: "
+                                  (or (ham-spot-view-age (ham-spot-view))
+                                      ham-spot-max-age))))
+  (setf (ham-spot-view-age (ham-spot-view))
+        (cond
+         ((<= minutes 0) nil)
+         ((>= minutes ham-spot-max-age)
+          (when (> minutes ham-spot-max-age)
+            (message "ham-spot: only %d minutes are kept; raise `ham-spot-max-age' for more"
+                     ham-spot-max-age))
+          nil)
+         (t minutes)))
+  (ham-spot-refresh))
+
+(defun ham-spot-reset-filters ()
+  "Clear every filter in this panel, keeping its feed and its order."
+  (interactive)
+  (let ((view (ham-spot-view)))
+    (setf (ham-spot-view-text view) nil
+          (ham-spot-view-exclude view) nil
+          (ham-spot-view-bands view) nil
+          (ham-spot-view-modes view) nil
+          (ham-spot-view-age view) nil))
   (ham-spot-refresh))
 
 (defun ham-spot-refresh-feeds ()
@@ -845,9 +1066,12 @@ all publish one."
   "<up>" #'ham-spot-previous
   "d" #'ham-spot-show-details
   "f" #'ham-spot-set-filter
+  "x" #'ham-spot-set-exclude
+  "m" #'ham-spot-set-modes
   "b" #'ham-spot-set-bands
   "s" #'ham-spot-set-sort
   "a" #'ham-spot-set-age
+  "F" #'ham-spot-reset-filters
   "g" #'ham-spot-refresh-feeds
   "c" #'ham-spot-clear
   "o" #'ham-spot-show-this-feed
@@ -865,17 +1089,37 @@ all publish one."
             ham-panel-indent
             "one and press RET to turn the radio to it.\n\n")
     (ham-insert-key-table "Keys" ham-spots-mode-map)
-    (insert (propertize "Which spots are shown\n" 'face 'ham-face-heading))
+    (insert (propertize "Filters belong to one panel\n" 'face 'ham-face-heading))
     (insert ham-panel-indent
-            (format "Age      %d minutes\n" ham-spot-max-age))
+            "Each panel keeps its own filters, order and position, so two\n"
+            ham-panel-indent
+            "windows side by side are two independent things: narrowing the\n"
+            ham-panel-indent
+            "parks to 20 metres leaves the cluster beside it alone.  The\n"
+            ham-panel-indent
+            "`ham-spot-filter' settings are what a new panel starts from.\n\n")
+    (insert (propertize "Asking for a mode\n" 'face 'ham-face-heading))
     (insert ham-panel-indent
-            (format "Bands    %s\n" (if ham-spot-bands
-                                        (string-join ham-spot-bands " ")
-                                      "all")))
-    (insert ham-panel-indent
-            (format "Filter   %s\n" (or ham-spot-filter "none")))
-    (insert ham-panel-indent
-            (format "Sort     %s\n\n" ham-spot-sort))
+            "`m' takes a family or an exact mode.  SSB finds spots marked\n"
+            ham-panel-indent
+            "USB and LSB as well; DATA finds FT8, RTTY and the rest; FT8\n"
+            ham-panel-indent
+            "finds only FT8.  The families are `ham-spot-mode-groups'.  A\n"
+            ham-panel-indent
+            "spot whose mode nobody reported is always shown: it is still a\n"
+            ham-panel-indent
+            "station on a frequency.\n\n")
+    (let* ((view (ham-spot-view))
+           (source (ham-spot-view-source view)))
+      (insert (propertize "This panel\n" 'face 'ham-face-heading))
+      (insert ham-panel-indent
+              (format "Feed     %s\n" (or source "all")))
+      (insert ham-panel-indent
+              (format "Showing  %s\n" (or (ham-spot-view-description view)
+                                          "everything held")))
+      (insert ham-panel-indent
+              (format "Held     %d minutes, for every panel\n\n"
+                      ham-spot-max-age)))
     (insert (propertize "The mode a spot shows\n" 'face 'ham-face-heading))
     (insert ham-panel-indent
             "Most networks report a frequency and nothing else, so the mode\n"
@@ -902,10 +1146,13 @@ all publish one."
     ["Tune, keeping the mode" ham-spot-qsy-frequency-only :keys "SPC"]
     ["Describe this spot" ham-spot-show-details :keys "d"]
     "---"
-    ["Filter" ham-spot-set-filter :keys "f"]
+    ["Show only matching" ham-spot-set-filter :keys "f"]
+    ["Hide matching" ham-spot-set-exclude :keys "x"]
+    ["Modes" ham-spot-set-modes :keys "m"]
     ["Bands" ham-spot-set-bands :keys "b"]
-    ["Sort" ham-spot-set-sort :keys "s"]
     ["Age" ham-spot-set-age :keys "a"]
+    ["Clear every filter" ham-spot-reset-filters :keys "F"]
+    ["Sort" ham-spot-set-sort :keys "s"]
     "---"
     ["Refresh" ham-spot-refresh-feeds :keys "g"]
     ["Clear" ham-spot-clear :keys "c"]
@@ -928,11 +1175,19 @@ all publish one."
   (setq-local cursor-type 'box))
 
 (defun ham-spot--panel (source)
-  "Return the panel buffer for SOURCE, creating and filling it if need be."
+  "Return the panel buffer for SOURCE, creating and filling it if need be.
+
+An existing panel keeps the view it has: reopening a window must not
+throw away the filters somebody set in it.  Only a new one starts from
+the defaults."
   (let ((buffer (get-buffer-create (ham-spot-buffer-name source))))
     (with-current-buffer buffer
       (unless (derived-mode-p 'ham-spots-mode) (ham-spots-mode))
-      (setq ham-spot--source-filter source)
+      (unless ham-spot--view
+        (setq ham-spot--view (ham-spot-default-view source)))
+      ;; The feed is the one thing a panel does not get to drift on: the
+      ;; buffer is named after it.
+      (setf (ham-spot-view-source ham-spot--view) source)
       (ham-spot-refresh))
     buffer))
 

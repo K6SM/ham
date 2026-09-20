@@ -632,17 +632,21 @@ rests on the transceiver's own transmit timeout — **enable it**.
 on one and press `RET`: the radio tunes to it, in the right mode.
 
 ```
-  Spots   14 shown of 31
-  RET tune   f filter   b band   s sort   g refresh   c clear   ? keys
+  Spots   8 shown
+  RET tune  f filter  m mode  b band  s sort  F clear filters  ? keys
 
   cluster: dxc.nc7j.com, DXSpider  31 spots   POTA: 24 spots, 40s ago
 
-    14074.0 20m  FT8    JR1FYS      12s  dxcluster LOUD in FL!
-    14320.0 20m  SSB    K4ABC       30s  pota      K-1234 Shenandoah NP
-     7005.0 40m  CW     VP8ABC      1m   dxcluster up 2
-    14062.0 20m  CW     G0ABC       2m   sota      G/LD-007 Great Gable
-    18100.0 17m  FT8    JA1XYZ      3m   dxcluster -12 dB
+    18100.0 17m  FT8   JR1FYS      1m  dxcluster LOUD in FL
+    14320.0 20m  SSB   K4ABC       2m  pota      K-1234 Shenandoah NP
+     7005.0 40m  CW    VP8ABC      4m  dxcluster up 2
+    14062.0 20m  CW    G0ABC       6m  sota      G/LD-007 Great Gable
+    14025.0 20m  CW    K1ABC       9m  dxcluster 599 NH
+     7180.0 40m  SSB   W1XYZ       11m pota      K-0055 Acadia NP
 ```
+
+One list, in age order, whatever feed each spot came from — the networks are
+interleaved rather than stacked in blocks.
 
 | Key | Action |
 | --- | --- |
@@ -651,15 +655,61 @@ on one and press `RET`: the radio tunes to it, in the right mode.
 | `n`, `p`, `↑`, `↓` | Move |
 | `d` | Everything known about this spot |
 | `f` | Show only spots matching a regexp |
+| `x` | Hide spots matching a regexp |
+| `m` | Show only certain modes |
 | `b` | Show only certain bands |
+| `a` | Show only the last so many minutes |
+| `F` | Clear every filter in this panel |
 | `s` | Sort by age, frequency, callsign or source |
-| `a` | How long to keep spots |
 | `g` | Ask every source for an update |
 | `c` | Discard spots — this panel's feed only, if it shows one |
 | `1` | One list for every feed |
 | `2` | A window for each feed |
 | `o` | Only this spot's feed |
 | `?` | This list |
+
+### Filtering
+
+Every filter belongs to the panel it was set in. Two windows side by side are
+two independent things: narrowing the parks to 20 metres leaves the cluster
+beside it showing everything.
+
+`m` takes a **family** or an exact mode:
+
+| Asked for | Finds |
+| --- | --- |
+| `SSB` | spots marked SSB, USB or LSB |
+| `PHONE` | those, plus AM and FM |
+| `CW` | CW, CWR |
+| `DATA` | FT8, FT4, RTTY, JS8, PSK31, WSPR and the rest |
+| `FT8` | only FT8 |
+
+so `m` then `SSB,CW` is phone and CW and nothing digital. The families are
+`ham-spot-mode-groups` and can be edited. A spot whose mode nobody reported is
+always shown — it is still a station on a frequency, and hiding it would lose
+real spots, which is the opposite of what asking for a mode is for.
+
+`f` and `x` are the two halves of a text filter, matched against the callsign,
+mode, band, spotter, reference, park or summit name and comment together. `x`
+usually gets more use: naming the one thing to hide is easier than naming
+everything else.
+
+```
+  DX cluster   1 shown of 31
+  RET tune  f filter  m mode  b band  s sort  F clear filters  ? keys
+
+  cluster: dxc.nc7j.com, DXSpider  31 spots
+  showing CW SSB   last 5 min
+
+     7005.0 40m  CW    VP8ABC      4m  up 2
+```
+
+A panel that is hiding anything says so under the header. A filter set an hour
+ago and forgotten otherwise looks exactly like a quiet band.
+
+`ham-spot-max-age` (60 minutes) is how long a spot is *held*, for every panel.
+`a` sets how much of that one panel *shows*, so one window can watch the last
+ten minutes while another keeps the hour.
 
 ### One list, or one window each
 
@@ -677,15 +727,21 @@ and `ham-spot-separate-buffers` makes that the default.
      7005.0 40m  CW   VP8ABC  1m │     7180.0 40m SSB W1XYZ 2m  K-0055 Acadia NP
 ```
 
-Each panel keeps its own filter, sort and cursor position, and `c` clears only
-that feed. A panel showing one feed spends the source column on the park or
-summit name instead, since every row in it would say the same thing.
+Each panel is wholly independent: its own filters, its own sort order, its own
+age window and its own cursor position, kept when the window is closed and
+reopened. `c` clears only that feed. A panel showing one feed spends the source
+column on the park or summit name instead, since every row in it would say the
+same thing.
 
 Worth having when the feeds are being used for different things: a contest
 weekend's cluster produces spots faster than anyone can read, and in a combined
 list it buries the handful of park and summit activations that were the reason
 for looking. `M-x ham-dxcluster`, `M-x ham-pota` and `M-x ham-sota` each open
 just that one.
+
+The `ham-spot-filter`, `ham-spot-modes`, `ham-spot-bands` and `ham-spot-sort`
+settings are what a **new** panel starts from, not state the panels go on
+sharing.
 
 ### The DX cluster
 
@@ -1027,9 +1083,14 @@ argued about.
 | `ham-dxcluster-host`, `-port` | nc7j, 7373 | Which cluster to connect to |
 | `ham-dxcluster-commands` | `nil` | Filters to send once logged in |
 | `ham-dxcluster-backlog-count` | `30` | Recent spots to ask for on connecting |
-| `ham-spot-max-age` | `60` | Minutes before a spot is dropped |
+| `ham-spot-max-age` | `60` | Minutes a spot is held, for every panel |
 | `ham-spot-max-spots` | `500` | Most spots to hold, however recent |
-| `ham-spot-sort` | `age` | Newest first, or by frequency, call or source |
+| `ham-spot-sort` | `age` | A new panel's order: age, frequency, call, source |
+| `ham-spot-filter` | `nil` | A new panel's "show only" regexp |
+| `ham-spot-exclude` | `nil` | A new panel's "hide" regexp |
+| `ham-spot-modes` | `nil` | A new panel's modes: `("SSB" "CW")` |
+| `ham-spot-bands` | `nil` | A new panel's bands |
+| `ham-spot-mode-groups` | SSB, CW, DATA… | Which modes each family name covers |
 | `ham-spot-qsy-sets-mode` | `t` | Whether tuning to a spot sets the mode too |
 | `ham-spot-separate-buffers` | `nil` | Give each feed its own window |
 | `ham-pota-programs` | `nil` | Park programs by reference prefix: `K`, `VE` |
