@@ -3,8 +3,8 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.3.0
-;; Package-Requires: ((emacs "29.1") (ham "0.6.0"))
+;; Version: 0.4.0
+;; Package-Requires: ((emacs "29.1") (ham "0.7.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
 
@@ -279,6 +279,27 @@ Returns how many spots were kept."
     (ham-publish ham-spot-topic-changed)
     (ham-spot--schedule-redisplay)
     (length kept)))
+
+(defun ham-spot-forget (source call)
+  "Drop SOURCE's spots for CALL, and return how many went.
+
+For a network that says when somebody has stopped.  Most do not: a spot
+is only ever an assertion that a station was heard, and the panel works
+out for itself when to stop believing it.  WWBOTA sends a spot marked
+QRT when an activator packs up, which is better information than
+waiting an hour for the last one to age out."
+  (let* ((wanted (upcase (or call "")))
+         (before (length ham-spot--spots)))
+    (setq ham-spot--spots
+          (seq-remove (lambda (spot)
+                        (and (eq (ham-spot-source spot) source)
+                             (equal (upcase (or (ham-spot-call spot) "")) wanted)))
+                      ham-spot--spots))
+    (let ((gone (- before (length ham-spot--spots))))
+      (when (> gone 0)
+        (ham-publish ham-spot-topic-changed)
+        (ham-spot--schedule-redisplay))
+      gone)))
 
 (defun ham-spot--acceptable-p (spot)
   "Return non-nil if SPOT is worth holding at all."

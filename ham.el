@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -55,6 +55,14 @@
 (require 'subr-x)
 (require 'seq)
 (require 'url-queue)
+(require 'gnutls)
+
+(defconst ham-version "0.7.0"
+  "Version of the ham.el family.
+
+Kept here as well as in the file header because a web service is told
+it, and a version in a user agent that drifts from the code is worse
+than none at all.")
 
 (defgroup ham nil
   "Amateur radio support for Emacs."
@@ -295,10 +303,20 @@ ON-LINE is called with each complete line.  ON-PARTIAL is called with
 whatever is left over after it, which is normally nothing: it exists
 for servers that prompt without a newline and then wait, where a
 line-oriented reader would sit forever with the question still in the
-buffer.  A DX cluster asking for a callsign is exactly that."
-  name host port process
+buffer.  A DX cluster asking for a callsign is exactly that.
+
+TLS, when non-nil, negotiates TLS on connecting, for a service reached
+over HTTPS rather than a plain socket.
+
+ON-CHUNK, when set, takes the raw text as it arrives and no line
+splitting is done at all.  It is for a protocol whose framing is not
+lines -- an HTTP response whose body is chunked, where the lengths
+between the chunks are in the stream alongside the content and a
+reader splitting on newlines would hand them to the caller as though
+they were part of it."
+  name host port process tls
   (pending "")
-  on-line on-partial on-status
+  on-line on-partial on-chunk on-status
   (state 'disconnected)
   (auto-reconnect t)
   (backoff nil)
@@ -323,6 +341,14 @@ buffer.  A DX cluster asking for a callsign is exactly that."
         (funcall (ham-connection-on-status conn) state detail)))))
 
 (defun ham--connection-filter (conn chunk)
+  "Accumulate CHUNK for CONN and dispatch each complete line.
+With an ON-CHUNK handler the raw text goes there instead, unsplit."
+  (if (ham-connection-on-chunk conn)
+      (with-demoted-errors "ham-connection: chunk handler error: %S"
+        (funcall (ham-connection-on-chunk conn) chunk))
+    (ham--connection-lines conn chunk)))
+
+(defun ham--connection-lines (conn chunk)
   "Accumulate CHUNK for CONN and dispatch each complete line."
   (setf (ham-connection-pending conn)
         (concat (ham-connection-pending conn) chunk))
@@ -471,18 +497,18 @@ for it would have a panel say it was about to reconnect forever."
     (ham--connection-set-state conn 'disconnected (string-trim event))
     (ham--connection-wait conn (string-trim event)))))
 
-(cl-defun ham-connection-make (&key name host port on-line on-partial on-status
-                                    (auto-reconnect t))
+(cl-defun ham-connection-make (&key name host port tls on-line on-partial
+                                    on-chunk on-status (auto-reconnect t))
   "Create a connection object for HOST and PORT named NAME.
 ON-LINE is called with each complete line received.  ON-PARTIAL, when
 given, is called with any text after the last newline, for a server
 that prompts without one.  ON-STATUS is called with a state symbol and
-an optional detail string.  The connection is not opened; call
-`ham-connection-open'."
+an optional detail string.  TLS, when non-nil, wraps the connection.
+The connection is not opened; call `ham-connection-open'."
   (ham--connection-create :name (or name (format "%s:%s" host port))
-                          :host host :port port
+                          :host host :port port :tls tls
                           :on-line on-line :on-partial on-partial
-                          :on-status on-status
+                          :on-chunk on-chunk :on-status on-status
                           :auto-reconnect auto-reconnect
                           :backoff ham-reconnect-initial-delay))
 
@@ -508,27 +534,39 @@ does not need."
   (ham--connection-set-state conn 'connecting)
   (condition-case err
       (setf (ham-connection-process conn)
-            (make-network-process
+            (apply
+             #'make-network-process
              :name (ham-connection-name conn)
              :host (ham-connection-host conn)
              :service (ham-connection-port conn)
              :nowait t
              :noquery t
              :coding 'utf-8-unix
-             ;; Both handlers ignore anything from a process that is no
-             ;; longer this connection's.  A superseded socket goes on
-             ;; delivering events after its replacement is up, and acting
-             ;; on those tears down the working link -- which schedules a
-             ;; reconnect, which replaces the working process, which
-             ;; delivers another stale event.  That loop runs forever at
-             ;; the reconnect interval and never backs off, because every
-             ;; successful open resets the backoff.
-             :filter (lambda (process chunk)
-                       (when (eq process (ham-connection-process conn))
-                         (ham--connection-filter conn chunk)))
-             :sentinel (lambda (process event)
+             (append
+              ;; TLS is negotiated by the process itself, after the
+              ;; socket is up, so it costs nothing on a connection that
+              ;; does not want it and needs no separate code path here.
+              (when (ham-connection-tls conn)
+                (list :tls-parameters
+                      (cons 'gnutls-x509pki
+                            (gnutls-boot-parameters
+                             :type 'gnutls-x509pki
+                             :hostname (ham-connection-host conn)))))
+              ;; Both handlers ignore anything from a process that is no
+              ;; longer this connection's.  A superseded socket goes on
+              ;; delivering events after its replacement is up, and acting
+              ;; on those tears down the working link -- which schedules a
+              ;; reconnect, which replaces the working process, which
+              ;; delivers another stale event.  That loop runs forever at
+              ;; the reconnect interval and never backs off, because every
+              ;; successful open resets the backoff.
+              (list
+               :filter (lambda (process chunk)
                          (when (eq process (ham-connection-process conn))
-                           (ham--connection-sentinel conn event)))))
+                           (ham--connection-filter conn chunk)))
+               :sentinel (lambda (process event)
+                           (when (eq process (ham-connection-process conn))
+                             (ham--connection-sentinel conn event)))))))
     (error
      (ham--connection-set-state conn 'disconnected (error-message-string err))
      (ham--connection-wait conn (error-message-string err))))
@@ -580,7 +618,7 @@ has shipped with Windows since 10/1803."
   :group 'ham)
 
 (defcustom ham-fetch-user-agent
-  (format "ham.el/%s (Emacs %s)" "0.6.0" emacs-version)
+  (format "ham.el/%s (Emacs %s)" ham-version emacs-version)
   "How these packages identify themselves to a web service.
 
 Several of the amateur radio services ask that a client say what it is,

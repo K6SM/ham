@@ -35,6 +35,8 @@ Everything works in a terminal.
 | `ham-dxcluster.el` | DX cluster client. |
 | `ham-pota.el` | Parks on the Air activations. |
 | `ham-sota.el` | Summits on the Air activations. |
+| `ham-wwff.el` | World Wide Flora and Fauna activations. |
+| `ham-bota.el` | Worldwide Bunkers on the Air, over an event stream. |
 
 ## Requirements
 
@@ -780,47 +782,87 @@ look when the panel stays empty.
 `M-x ham-dxcluster-spot` posts a spot of your own to the network. It confirms
 first: that one is not undoable and not anonymous.
 
-### Parks and summits
+### Parks, summits, nature reserves and bunkers
 
 ```elisp
-(require 'ham-pota)
-(require 'ham-sota)
+(require 'ham-pota)     ; Parks on the Air
+(require 'ham-sota)     ; Summits on the Air
+(require 'ham-wwff)     ; World Wide Flora and Fauna
+(require 'ham-bota)     ; Worldwide Bunkers on the Air
 ```
 
-Nothing to configure and no account needed — both publish their current
-activations openly. Each is read every two minutes, and never more often than
-once a minute, which is SOTA's published rule and ordinary politeness towards
-POTA.
+Nothing to configure and no account needed — all four publish their current
+activations openly.
 
 ```elisp
-(setq ham-pota-programs '("K" "VE"))    ; North American parks only
-(setq ham-sota-associations '("W7W"))   ; one SOTA association
-(setq ham-pota-include-rbn nil)         ; people, not skimmers
+(setq ham-pota-programs '("K" "VE"))     ; North American parks only
+(setq ham-sota-associations '("W7W"))    ; one SOTA association
+(setq ham-wwff-programs '("KFF"))        ; one WWFF national programme
+(setq ham-bota-programs '("G" "GM"))     ; British bunkers
+(setq ham-pota-include-rbn nil)          ; people, not skimmers
 ```
 
 Canadian Parks on the Air is POTA's `VE` references rather than a separate
-network, so `ham-pota-programs` covers it. WWFF and BOTA are not POTA and still
-need their own back ends.
+network, so `ham-pota-programs` covers it. Plenty of references are both a park
+and a nature reserve, so the same operator turns up in the POTA and WWFF panels
+under two different numbers.
 
-Three things about these two are worth knowing, because each was a trap:
+**No two of these agree on how to send a frequency.** All four send a bare
+number with nothing saying what unit it is:
 
-- **POTA sends kilohertz and SOTA sends megahertz.** Both send the number as a
-  string and neither says which it is. A parser written for one and pointed at
-  the other is wrong by a factor of a thousand.
-- **Both send UTC timestamps with no zone marker.** Read as local time, every
-  spot arrives hours old, ages straight out of the panel, and the panel shows
-  nothing with no indication why.
-- **The old SOTA host still answers.** `api2.sota.org.uk` is retired but
-  returns HTTP 200 with placeholder records saying `DEPRECATED` instead of
-  failing, so a client pointed at it looks like it is working and shows
-  fiction. `ham-sota-host` defaults to `api-db2.sota.org.uk`, and the answer is
-  checked for those placeholders so a stale setting produces a plain error.
+| Feed | Frequency | Timestamp |
+| --- | --- | --- |
+| POTA | kHz, as a string | UTC text, no zone marker |
+| SOTA | MHz, as a string | UTC text, no zone marker |
+| WWFF | kHz, as a number | Unix epoch seconds |
+| WWBOTA | either, as a number | ISO text |
 
-Unlike a cluster, these are asked rather than listened to, and each answer is
-the whole current list. So an answer *replaces* what that feed had rather than
-merging into it: an activator who has packed up is simply absent next time, and
-merging would leave them on the panel for an hour looking exactly like somebody
-still calling CQ.
+A parser written for one and pointed at another is wrong by a factor of a
+thousand, which puts the radio in a different band without anything looking
+amiss. WWBOTA is the awkward one: it sends `14.285` sometimes and `14285`
+others, so the magnitude decides — in the amateur bands no number is ambiguous,
+since 14 kHz and 14 MHz are not both places somebody is activating from.
+
+The timestamps are the other trap. Read UTC text as local time and every spot
+arrives hours old, ages straight out of the panel, and the panel shows nothing
+with no indication why.
+
+**The old SOTA host still answers.** `api2.sota.org.uk` is retired but returns
+HTTP 200 with placeholder records saying `DEPRECATED` instead of failing, so a
+client pointed at it looks like it is working and shows fiction.
+`ham-sota-host` defaults to `api-db2.sota.org.uk`, and the answer is checked
+for those placeholders so a stale setting produces a plain error.
+
+POTA, SOTA and WWFF are polled every two minutes, never more often than once a
+minute — SOTA's and WWFF's published rule, and ordinary politeness towards
+POTA. Each answer is the whole current list, so it *replaces* what that feed
+had rather than merging into it: an activator who has packed up is simply
+absent next time, and merging would leave them on the panel for an hour looking
+exactly like somebody still calling CQ.
+
+### Bunkers, and the event stream
+
+WWBOTA is not polled. It holds one HTTPS request open and pushes each spot down
+it as Server-Sent Events, so `ham-bota` opens a single connection and leaves it
+there. `ham-bota-backlog-hours` says how much history to send first, which is
+why the panel has something in it immediately rather than waiting for whoever
+is next on the air.
+
+That makes it the only feed here that is neither a poll nor a telnet session,
+and the reason the shared transport grew TLS and a raw-text mode. An HTTP body
+arrives in chunks, each introduced by its length in the same stream as the
+content, and a reader splitting the lot on newlines both hands those lengths to
+the caller as content and loses any event large enough to be split across two
+chunks. `ham-bota` undoes the chunking before it looks for lines.
+
+WWBOTA also says when somebody has **stopped**: a spot marked `QRT` removes
+that activator from the panel rather than adding anything. No other feed here
+does that, and it beats waiting an hour for their last spot to age out looking
+exactly like somebody still calling. A spot marked `Test` is somebody checking
+their equipment, and is left out unless `ham-bota-include-tests` says otherwise.
+
+One activation can count for several bunkers at once, so the first reference is
+named and the rest are counted: `B/G-0123 Pillbox Hill (+1)`.
 
 ### The mode a spot shows
 
@@ -881,17 +923,24 @@ because of it, and is the one to copy.
 `ham-fetch-json` in `ham.el` is underneath both: curl when it is on PATH and
 `url.el` when it is not, asynchronous either way, on every platform.
 
+A network that **streams** — WWBOTA, holding a request open and pushing events
+— uses `ham-connection` directly, with `:tls t` and an `:on-chunk` handler that
+gets the raw text rather than lines. `ham-bota.el` is the one to copy for that,
+and it is longer than the polled back ends for the reason its own section
+explains.
+
 ### Not yet done
 
-WWFF, BOTA, PSK Reporter and DXpeditions are the remaining sources. Canadian
-Parks on the Air needs no back end — it is POTA's `VE` references, reachable
-through `ham-pota-programs`.
+PSK Reporter and DXpeditions are the remaining sources. Canadian Parks on the
+Air needs no back end — it is POTA's `VE` references, reachable through
+`ham-pota-programs`.
 
-Note that HamClock, which has all of these, gets none of them from the programs
-themselves: its own server aggregates them into a single file that every clock
-downloads. There is no such server here, so each program's API is read
-directly — which is why they are separate pieces of work rather than one, and
-why the units and timestamp quirks above had to be found one network at a time.
+Note that the HamClock family gets its park and summit spots from an
+aggregation server of its own rather than from the programs: one file that
+every clock downloads, built server-side. There is no such server here, so each
+programme's API is read directly — which is why these were separate pieces of
+work rather than one, and why the units and timestamp quirks above had to be
+found one network at a time.
 
 ## Space weather
 
@@ -1099,6 +1148,11 @@ argued about.
 | `ham-sota-host` | api-db2 | The SOTA API; not the retired api2 |
 | `ham-sota-associations` | `nil` | SOTA associations to show |
 | `ham-sota-window` | `120` | Minutes of SOTA spots to ask for |
+| `ham-wwff-programs` | `nil` | WWFF national programmes: `KFF`, `DLFF` |
+| `ham-wwff-interval` | `120` | Seconds between reads of WWFF |
+| `ham-bota-programs` | `nil` | WWBOTA programmes, without the `B/`: `G`, `DL` |
+| `ham-bota-backlog-hours` | `1` | Hours of history the stream sends on opening |
+| `ham-bota-include-tests` | `nil` | Show spots marked as an equipment test |
 | `ham-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
 | `ham-spacewx-fetch-backend` | `auto` | `curl` subprocess, or Emacs's `url.el` |
 | `ham-spacewx-panel-width` | `50` | Columns the panel lays itself out to |
@@ -1162,21 +1216,27 @@ distance and bearing, `ham-band-for-frequency`, `ham-parse-frequency` and
 
 ## Credits
 
-The propagation estimate's parameterisation is adapted from
-[OpenHamClock](https://github.com/accius/openhamclock), MIT licensed. The DX
-cluster handling — how to tell the three families of cluster software apart,
-what to ask each one for a backlog, and the detail that the login prompt
-arrives with no newline after it — was checked against the same project's
-`dxcluster.cpp`, which has had far more hours on real clusters than this has.
-The band segment table follows the one the DX cluster software publishes in its
-`bands.pl`, corrected where the published tables lag practice: 30 metre FT8 is
-at 10136, not 10131.
+Two separate projects, easily confused, helped here and are credited apart.
 
-Park and summit spots come from
-[Parks on the Air](https://pota.app/) and
-[Summits on the Air](https://www.sota.org.uk/), whose spotting APIs are public
-and read-only. The field names and units were checked against working clients
-of both rather than guessed at.
+[OpenHamClock](https://github.com/accius/openhamclock) supplied the propagation
+estimate's parameterisation, and its `useWWBOTASpots` hook is where the WWBOTA
+endpoint and the shape of a bunker spot came from — including that the stream
+is Server-Sent Events and that a `QRT` spot means somebody has finished.
+
+[HamClock](https://www.clearskyinstitute.com/ham/HamClock/) supplied the DX
+cluster handling: how to tell the three families of cluster software apart,
+what to ask each one for a backlog, and the detail that the login prompt
+arrives with no newline after it. Its `dxcluster.cpp` has had far more hours on
+real clusters than this has. The band segment table follows the one the DX
+cluster software publishes in its `bands.pl`, corrected where the published
+tables lag practice: 30 metre FT8 is at 10136, not 10131.
+
+Activation spots come from [Parks on the Air](https://pota.app/),
+[Summits on the Air](https://www.sota.org.uk/),
+[World Wide Flora and Fauna](https://wwff.co/) and
+[Worldwide Bunkers on the Air](https://wwbota.net/), whose spotting APIs are
+public and read-only. The field names and units of each were checked against
+working clients rather than guessed at, because no two of them agree.
 
 Space weather data comes from the
 [NOAA Space Weather Prediction Center](https://www.swpc.noaa.gov/), a work of
