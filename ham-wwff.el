@@ -4,7 +4,7 @@
 
 ;; Author: K6SM
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (ham "0.7.0") (ham-spot "0.3.0"))
+;; Package-Requires: ((emacs "29.1") (ham "0.6.0") (ham-spot "0.2.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
 

@@ -250,6 +250,15 @@ separately under `AGC levels` — `0=OFF 1=SUPERFAST 2=FAST 5=MEDIUM 3=SLOW
 with the rig's own names for its own positions, and a radio with four gets
 four.
 
+**A switch is held to its positions, not to its range.** For the preamp, the
+attenuator and AGC those are different things, and the range is the misleading
+one. An FTDX10 declares `PREAMP(10..20/10)` while its preamp has three
+positions — off, 10 dB and 20 dB — so the declared range does not contain
+*off* at all; it declares `ATT(12..12/0)` while its attenuator has four
+positions; and it declares `AGC(0..0/0)`. The positions come from the
+`Preamp:`, `Attenuator:` and `AGC levels:` lines instead, and a value sent to
+one of these controls is snapped to the nearest position on that list.
+
 ### Units
 
 Hamlib reports most levels as a fraction rather than in the radio's own units.
@@ -272,6 +281,12 @@ Two limits are worth knowing:
 - Where Hamlib has already flattened a scale, the original is unrecoverable.
   The FTDX10's DNR runs 1 to 15 on the radio; Hamlib presents 0 to 1 in tenths,
   so it reads as a percentage.
+
+A percentage moves by one percent a press. Hamlib reports the step of several
+of these levels as one 255th, because that is what fits in the byte the radio
+is sent — and four tenths of a percent rounds to the number already on the
+screen, so the key looks broken while working perfectly.
+`ham-rig-percent-step` sets the floor.
 
 ### Filter width
 
@@ -1120,6 +1135,7 @@ argued about.
 | `ham-rig-meter-units` | comp, VDD, ID | Full scale for normalised meters |
 | `ham-rig-meter-zones` | SWR at 2 and 3 | Where a meter turns amber and red |
 | `ham-rig-controls-exclude` | `nil` | Controls to omit |
+| `ham-rig-percent-step` | `0.01` | Smallest change to a normalised level |
 | `ham-rig-passband-ranges` | per mode | Filter width range and step, as (MODE MIN MAX STEP) |
 | `ham-rig-poll-when-hidden` | `nil` | Keep polling with no panel visible |
 | `ham-rig-mode-aliases` | FT8 → PKTUSB, … | What a spot's mode is called on the radio |

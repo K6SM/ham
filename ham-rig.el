@@ -3,8 +3,8 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.2.2
-;; Package-Requires: ((emacs "29.1") (ham "0.1.0"))
+;; Version: 0.2.3
+;; Package-Requires: ((emacs "29.1") (ham "0.5.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
 
@@ -2093,18 +2093,35 @@ printed on the radio, and a percentage at least reads as a proportion."
        (>= (ham-rig--control-min control) 0)
        (= (ham-rig--control-max control) 1)))
 
+(defcustom ham-rig-percent-step 0.01
+  "Smallest change to make to a normalised level, as a fraction.
+
+Hamlib reports the step of several levels as one 255th, because that is
+what fits in the byte the radio is sent.  A panel showing those as whole
+percentages then has a key that moves the value by four tenths of one
+percent, which rounds to the number already on the screen: the reading
+does not change, the meter does not move, and the control looks broken
+while working perfectly.  One percent is the smallest change that shows."
+  :type 'number
+  :group 'ham-rig)
+
 (defun ham-rig--control-usable-step (control)
   "Return a step for CONTROL that is safe to adjust by.
+
 Hamlib reports a step of zero for some levels, which cannot be used as
-an increment."
-  (let ((step (ham-rig--control-step control))
-        (span (- (or (ham-rig--control-max control) 0)
-                 (or (ham-rig--control-min control) 0))))
-    (cond
-     ((and step (> step 0)) step)
-     ((>= span 100) 1)
-     ((> span 0) (/ span 100.0))
-     (t 1))))
+an increment, and a step finer than the reading for others, which can
+be used but cannot be seen."
+  (let* ((step (ham-rig--control-step control))
+         (span (- (or (ham-rig--control-max control) 0)
+                  (or (ham-rig--control-min control) 0)))
+         (usable (cond
+                  ((and step (> step 0)) step)
+                  ((>= span 100) 1)
+                  ((> span 0) (/ span 100.0))
+                  (t 1))))
+    (if (ham-rig--control-percent-p control)
+        (max usable ham-rig-percent-step)
+      usable)))
 
 (defun ham-rig--whole-number-p (n)
   "Return non-nil if N has no fractional part.
@@ -2246,6 +2263,39 @@ KIND and COALESCE are as for `ham-rig--read-control'."
         (ham-rig--enqueue-latest command command callback)
       (ham-rig--enqueue command callback kind))))
 
+(defun ham-rig--acceptable-value (control value)
+  "Return the nearest value to VALUE that CONTROL will actually take.
+
+A control with a list of positions is held to that list.  Its numeric
+range must not be used for this, because for a switch Hamlib\\='s range
+describes something else entirely: an FTDX10 declares
+`PREAMP(10..20/10)\\=' while its preamp has three positions -- off, 10 dB
+and 20 dB -- and `ATT(12..12/0)\\=' while its attenuator has four.  The
+positions are published separately, as `Preamp:\\=' and `Attenuator:\\='
+lines.
+
+Clamping to the declared range instead meant every attenuator setting
+became 12 dB, the preamp could be switched on but never back off, and
+AGC -- declared `AGC(0..0/0)\\=' with its settings in an `AGC levels:\\='
+line -- went to OFF whichever setting was asked for.
+
+Anything without positions is clamped to its range as before, and a
+range that says nothing, which Hamlib writes as 0..0, clamps to
+nothing."
+  (let ((positions (ham-rig--control-discrete-values control))
+        (low (ham-rig--control-min control))
+        (high (ham-rig--control-max control)))
+    (cond
+     (positions
+      (let ((best (car positions)))
+        (dolist (position (cdr positions))
+          (when (< (abs (- position value)) (abs (- best value)))
+            (setq best position)))
+        best))
+     ((and (numberp low) (numberp high) (< low high))
+      (max low (min high value)))
+     (t value))))
+
 (defun ham-rig--write-control (control value)
   "Send VALUE for CONTROL, then read it back to see what the rig did."
   (unless (ham-rig-connected-p)
@@ -2256,8 +2306,7 @@ KIND and COALESCE are as for `ham-rig--read-control'."
           (ham-rig--set-control-value control (and value t))
           (ham-rig--enqueue-latest (format "U %s" name)
                                    (format "U %s %d" name (if value 1 0))))
-      (let ((clamped (max (ham-rig--control-min control)
-                          (min (ham-rig--control-max control) value))))
+      (let ((clamped (ham-rig--acceptable-value control value)))
         (ham-rig--set-control-value control clamped)
         (if (eq (ham-rig--control-kind control) 'width)
             ;; Sent as a mode change, carrying the mode the rig is
