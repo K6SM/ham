@@ -595,5 +595,287 @@ ones."
     (ham-rig--enqueue "F 14074000" nil 'user)
     (should (= (length ham-rig--queue) 2))))
 
+
+;;;; A change the rig refuses
+
+;; Hamlib 4.5.x sends an FTDX10 a broken RF gain command -- a NUL where
+;; the VFO digit belongs -- and the radio refuses it.  rigctld said so
+;; with RPRT -5, eight seconds later, and nothing was listening: the
+;; panel showed the new value until the read-back brought the old one
+;; home, which looked like the panel was broken.
+
+(defmacro ham-rig-tests--with-link (&rest body)
+  "Run BODY with a pretend rigctld link.
+Everything sent is pushed onto `sent', newest first, and every message
+onto `messages'.  Replies are fed in with `ham-rig--on-line'."
+  (declare (indent 0) (debug t))
+  `(let ((sent nil)
+         (messages nil)
+         (ham-rig--queue nil)
+         (ham-rig--inflight nil)
+         (ham-rig--resp-lines nil)
+         (ham-rig--owed nil)
+         (ham-rig--stats (ham-rig--fresh-stats))
+         (ham-rig--control-failures (make-hash-table :test #'equal))
+         (ham-rig--state (make-hash-table :test #'eq)))
+     (cl-letf (((symbol-function 'ham-connection-live-p) (lambda (_) t))
+               ((symbol-function 'ham-connection-send)
+                (lambda (_ text) (push text sent) t))
+               ((symbol-function 'ham-rig--schedule-redisplay) #'ignore)
+               ((symbol-function 'ham-rig--schedule-controls-redisplay) #'ignore)
+               ((symbol-function 'message)
+                (lambda (format &rest args)
+                  (push (apply #'format-message format args) messages))))
+       ,@body)))
+
+(defun ham-rig-tests--reply (&rest lines)
+  "Feed LINES to the link as though rigctld had sent them."
+  (mapc #'ham-rig--on-line lines))
+
+(defun ham-rig-tests--give-up ()
+  "Let the request in flight time out."
+  (let ((ham-rig-request-timeout -1))
+    (ham-rig--check-timeout)))
+
+(ert-deftest ham-rig-test-a-refused-change-is-reported ()
+  "RPRT -5 after a set means the rig did not change, and says why."
+  (ham-rig-tests--with-caps ham-rig-tests--caps
+    (ham-rig-tests--with-link
+      (ham-rig--write-control (ham-rig-tests--control "RF") 0.5)
+      (should (equal (car (last sent)) "+L RF 0.500000"))
+      (ham-rig-tests--reply "set_level: RF 0.500000" "RPRT -5")
+      (should (string-match-p "timed out"
+                              (gethash "RF" ham-rig--control-failures)))
+      (should (cl-some (lambda (m) (string-match-p "RF was not set to 50%" m))
+                       messages)))))
+
+(ert-deftest ham-rig-test-a-refused-function-is-reported ()
+  "A switch the rig will not throw is reported the same way."
+  (ham-rig-tests--with-caps ham-rig-tests--caps
+    (ham-rig-tests--with-link
+      (ham-rig--write-control (ham-rig-tests--control "TUNER") t)
+      (ham-rig-tests--reply "set_func: TUNER 1" "RPRT -9")
+      (should (string-match-p "rejected"
+                              (gethash "TUNER" ham-rig--control-failures)))
+      (should (cl-some (lambda (m) (string-match-p "was not set to on" m))
+                       messages)))))
+
+(ert-deftest ham-rig-test-a-change-that-works-clears-the-report ()
+  "The note stays until the control is changed successfully."
+  (ham-rig-tests--with-caps ham-rig-tests--caps
+    (ham-rig-tests--with-link
+      (puthash "RF" "timed out waiting for the rig (RPRT -5)"
+               ham-rig--control-failures)
+      (ham-rig--write-control (ham-rig-tests--control "RF") 0.5)
+      (ham-rig-tests--reply "set_level: RF 0.500000" "RPRT 0")
+      (should-not (gethash "RF" ham-rig--control-failures))
+      (should-not messages))))
+
+(ert-deftest ham-rig-test-a-late-refusal-is-still-reported ()
+  "Hamlib retries a refused command for longer than we wait for it.
+
+The answer to a change is the one most likely to arrive after the
+request has been given up on, so it must not be thrown away with the
+stale readings.  And since the read-back sent meanwhile cannot have
+seen it, the control is read again."
+  (ham-rig-tests--with-caps ham-rig-tests--caps
+    (ham-rig-tests--with-link
+      (ham-rig--write-control (ham-rig-tests--control "RF") 0.5)
+      (ham-rig-tests--give-up)
+      ;; The read-back went out in its place.
+      (should (equal (car sent) "+l RF"))
+      (should (= (length ham-rig--owed) 1))
+      (ham-rig-tests--reply "set_level: RF 0.500000" "RPRT -5")
+      (should (gethash "RF" ham-rig--control-failures))
+      (should-not ham-rig--owed)
+      ;; The read-back is answered, and another read is waiting.
+      (ham-rig-tests--reply "get_level: RF" "1.000000" "RPRT 0")
+      (should (= (gethash "RF" ham-rig--levels) 1.0))
+      (should (equal (car sent) "+l RF"))
+      (should (= (cl-count "+l RF" sent :test #'equal) 2)))))
+
+(ert-deftest ham-rig-test-a-late-reading-is-still-thrown-away ()
+  "Only a change has a use for its late answer.  A reading arriving
+late is stale, and must neither reach its callback nor be taken for
+the answer to the next request."
+  (ham-rig-tests--with-link
+    (let ((called nil))
+      (ham-rig--enqueue "l RF" (lambda (_) (setq called t)))
+      (ham-rig-tests--give-up)
+      (should (= (length ham-rig--owed) 1))
+      (ham-rig--enqueue "f" (lambda (r) (setq called (ham-rig--val r "Frequency"))))
+      (ham-rig-tests--reply "get_level: RF" "1.000000" "RPRT 0")
+      (should-not called)
+      (ham-rig-tests--reply "get_freq:" "Frequency: 14074000" "RPRT 0")
+      (should (equal called "14074000")))))
+
+(ert-deftest ham-rig-test-a-panic-unkey-reply-is-still-discarded ()
+  "The unkey sent past the queue owes a reply with nothing waiting
+for it, and it is discarded in its turn."
+  (ham-rig-tests--with-link
+    (cl-letf (((symbol-function 'ham-rig--verify-unkey) #'ignore))
+      (ham-rig--enqueue "l RF" #'ignore)
+      (ham-rig-panic-unkey)
+      (should (equal ham-rig--owed '(nil nil)))
+      (ham-rig-tests--reply "RPRT 0" "RPRT 0")
+      (should-not ham-rig--owed))))
+
+(ert-deftest ham-rig-test-the-panel-shows-a-refused-change ()
+  "On the control's own line, so it is not lost with the echo area."
+  (ham-rig-tests--with-caps ham-rig-tests--caps
+    (let ((ham-rig--control-failures (make-hash-table :test #'equal))
+          (rf (ham-rig-tests--control "RF")))
+      (should-not (string-match-p "not set" (ham-rig--render-control rf)))
+      (puthash "RF" "timed out waiting for the rig (RPRT -5)"
+               ham-rig--control-failures)
+      (should (string-match-p "not set: timed out"
+                              (ham-rig--render-control rf))))))
+
+(ert-deftest ham-rig-test-return-codes-are-described ()
+  "rigctld's numbers, in words."
+  (should (string-match-p "timed out" (ham-rig--describe-rc -5)))
+  (should (string-match-p "rejected" (ham-rig--describe-rc -9)))
+  (should (string-match-p "not available" (ham-rig--describe-rc -11)))
+  (should (equal (ham-rig--describe-rc -99) "error -99")))
+
+
+;;;; The other VFO
+
+(defconst ham-rig-tests--vfo-caps
+  "Model name:\tFTDX-10
+Has targetable VFO: Y
+Targetable features: FREQ MODE TONE FUNC LEVEL RITXIT PTT MEM BANK
+VFO list: VFOA VFOB MEM
+Set level: RF(0..1/0.00392157)
+"
+  "Capabilities as Hamlib 4.7 prints them for an FTDX10.")
+
+(defun ham-rig-tests--vfo-info (name hz mode)
+  "Return rigctld's lines for `\\get_vfo_info NAME' at HZ in MODE."
+  (list (concat "get_vfo_info: " name)
+        (format "Freq: %d" hz) (concat "Mode: " mode)
+        "Width: 1950" "Split: 0" "SatMode: 0"))
+
+(ert-deftest ham-rig-test-the-other-vfo-is-the-one-not-in-use ()
+  "B while on A, A while on B, and B before the rig has said."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (should (equal (ham-rig--other-vfo-name) "VFOB"))
+      (ham-rig--set 'vfo "VFOA")
+      (should (equal (ham-rig--other-vfo-name) "VFOB"))
+      (ham-rig--set 'vfo "VFOB")
+      (should (equal (ham-rig--other-vfo-name) "VFOA")))))
+
+(ert-deftest ham-rig-test-the-other-vfo-is-spelt-the-rigs-way ()
+  "Hamlib answers a name it does not know with the current VFO, so a rig
+with two receivers must be asked for Sub, not VFOB."
+  (ham-rig-tests--with-caps "VFO list: Main Sub MEM\n"
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (ham-rig--set 'vfo "Main")
+      (should (equal (ham-rig--other-vfo-name) "Sub"))
+      (ham-rig--set 'vfo "Sub")
+      (should (equal (ham-rig--other-vfo-name) "Main")))))
+
+(ert-deftest ham-rig-test-a-rig-with-one-vfo-has-no-other ()
+  "Nothing to show, so nothing is asked for."
+  (ham-rig-tests--with-caps "VFO list: VFOA MEM\nHas targetable VFO: Y\n"
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (should-not (ham-rig--other-vfo-name))
+      (should-not (ham-rig--other-vfo-wanted-p))
+      (should (equal (ham-rig--render-other-vfo) "")))))
+
+(ert-deftest ham-rig-test-targetable-frequency-from-either-hamlib ()
+  "4.6 and later list the features; 4.5 only says whether there are any."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (should (ham-rig--targetable-frequency-p)))
+  (ham-rig-tests--with-caps "Has targetable VFO: Y\nTargetable features: MODE\n"
+    (should-not (ham-rig--targetable-frequency-p)))
+  (ham-rig-tests--with-caps "Has targetable VFO: Y\n"
+    (should (ham-rig--targetable-frequency-p)))
+  (ham-rig-tests--with-caps "Has targetable VFO: N\n"
+    (should-not (ham-rig--targetable-frequency-p))))
+
+(ert-deftest ham-rig-test-a-rig-that-must-switch-is-left-alone ()
+  "Reading the other VFO on such a rig flips the radio to it and back
+every second.  Only asking for it outright does that."
+  (ham-rig-tests--with-caps "VFO list: VFOA VFOB\nHas targetable VFO: N\n"
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (let ((ham-rig-show-other-vfo 'auto))
+        (should-not (ham-rig--other-vfo-wanted-p)))
+      (let ((ham-rig-show-other-vfo t))
+        (should (ham-rig--other-vfo-wanted-p)))))
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq))
+          (ham-rig-show-other-vfo nil))
+      (should-not (ham-rig--other-vfo-wanted-p)))))
+
+(ert-deftest ham-rig-test-the-other-vfo-is-read-and-shown ()
+  "Its frequency, band, name and mode, on a line of its own."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (ham-rig--set 'vfo "VFOA")
+      (ham-rig--note-other-vfo
+       "VFOB" (ham-rig-tests--response
+               (ham-rig-tests--vfo-info "VFOB" 7074000 "USB")))
+      (should (equal (ham-rig-other-vfo) '("VFOB" 7074000 "USB")))
+      (let ((line (substring-no-properties (ham-rig--render-other-vfo))))
+        (should (string-match-p "7\\.074\\.000" line))
+        (should (string-match-p "40m" line))
+        (should (string-match-p "VFOB USB" line))
+        (should-not (string-match-p "TX" line))))))
+
+(ert-deftest ham-rig-test-the-transmitting-vfo-is-marked-in-split ()
+  "In split the other VFO is usually the one that transmits."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (ham-rig--set 'vfo "VFOA")
+      (ham-rig--set 'split t)
+      (ham-rig--set 'split-vfo "VFOB")
+      (ham-rig--set 'other-vfo '("VFOB" 14025000 "CW"))
+      (should (string-match-p "TX" (ham-rig--render-other-vfo))))))
+
+(ert-deftest ham-rig-test-a-reading-for-the-wrong-vfo-is-not-shown ()
+  "Just after a swap the stored reading is of the VFO now in use.  Shown
+underneath, the main frequency would appear twice."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq)))
+      (ham-rig--set 'vfo "VFOB")
+      (ham-rig--set 'other-vfo '("VFOB" 7074000 "USB"))
+      (should-not (ham-rig-other-vfo))
+      (should (string-match-p "---" (ham-rig--render-other-vfo))))))
+
+(ert-deftest ham-rig-test-no-vfo-info-command-stops-the-asking ()
+  "rigctld before 4.1 has no get_vfo_info.  A timeout, on the other
+hand, is no reason to give up."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (let ((ham-rig--state (make-hash-table :test #'eq))
+          (ham-rig--other-vfo-unavailable nil))
+      (cl-letf (((symbol-function 'ham-rig--schedule-redisplay) #'ignore))
+        (ham-rig--note-other-vfo "VFOB" (ham-rig-tests--response nil -5))
+        (should (ham-rig--other-vfo-wanted-p))
+        (ham-rig--note-other-vfo "VFOB" (ham-rig-tests--response nil -11))
+        (should-not (ham-rig--other-vfo-wanted-p))))))
+
+(ert-deftest ham-rig-test-the-poll-asks-for-the-vfo-the-rig-just-named ()
+  "Swap VFOs at the radio and the next poll asks for the right one: the
+question waits for the answer to `v' rather than going out beside it."
+  (ham-rig-tests--with-caps ham-rig-tests--vfo-caps
+    (ham-rig-tests--with-link
+      (let ((ham-rig--other-vfo-unavailable nil))
+        (ham-rig--set 'vfo "VFOA")
+        (cl-letf (((symbol-function 'ham-rig--should-poll-p) (lambda () t))
+                  ((symbol-function 'ham-rig--poll-controls) #'ignore))
+          (ham-rig--poll-slow))
+        (should-not (cl-find-if (lambda (s) (string-match-p "get_vfo_info" s))
+                                sent))
+        (ham-rig-tests--reply "get_mode:" "Mode: USB" "Passband: 1950" "RPRT 0")
+        (ham-rig-tests--reply "get_vfo:" "VFO: VFOB" "RPRT 0")
+        (ham-rig-tests--reply "get_split_vfo:" "Split: 0" "TX VFO: VFOA" "RPRT 0")
+        (should (equal (car sent) "+\\get_vfo_info VFOA"))
+        (apply #'ham-rig-tests--reply
+               (append (ham-rig-tests--vfo-info "VFOA" 14074000 "USB")
+                       '("RPRT 0")))
+        (should (equal (ham-rig-other-vfo) '("VFOA" 14074000 "USB")))))))
+
 (provide 'ham-rig-tests)
 ;;; ham-rig-tests.el ends here

@@ -50,7 +50,10 @@ Everything works in a terminal.
   is the one to start with, and [Getting started with audio](#getting-started-with-audio)
   walks through it from nothing. `trx` and `zita-njbridge` are alternatives.
 
-Developed on Emacs 29.3 and Hamlib 4.5.5, tested with a Yaesu FTDX10.
+Developed on Emacs 29.3 and Hamlib 4.5.5, tested with a Yaesu FTDX10. For an
+FTDX10, use Hamlib 4.6 or later: 4.5.x cannot set its RF gain, and gets three
+other controls wrong (see [When a control will not change](#when-a-control-will-not-change)).
+Checked against 4.7.2.
 
 ## Installation
 
@@ -93,11 +96,17 @@ emulation, which gives you LAN remote operation with wfview carrying the audio.
   FTDX-10   connected   localhost:4532
 
   14.074.000   20m   STEP 1 k
+  7.074.000   40m    VFOB USB
 
   VFO VFOA    MODE USB       BW 2400 Hz   SPLIT off
 
   RX  ████▏░░░░░░░░░░░░░░░░  S3
 ```
+
+The large frequency is the VFO the receiver is on. The line under it is the
+other VFO: VFO B while you are on A, VFO A after `v` swaps them, and Sub or
+Main on a rig with two receivers. In split, the VFO that transmits is marked
+`TX`.
 
 | Key | Action |
 | --- | --- |
@@ -122,6 +131,17 @@ emulation, which gives you LAN remote operation with wfview carrying the audio.
 | `?` `h` | Every key, in a buffer |
 | `i` | Capabilities the radio reported |
 | `S` | Link statistics |
+
+### The other VFO
+
+It is read once a slow poll with `\get_vfo_info`, which Hamlib added in 4.1.
+A rig that cannot read a VFO without switching to it would flip to the other
+VFO and back every second, so on such a rig the line is left off. Hamlib 4.6
+and later say so in `Targetable features`; 4.5 in `Has targetable VFO`. `i`
+shows both.
+
+`ham-rig-show-other-vfo` overrides that: `t` shows it on any rig, `nil` on
+none. `ham-rig-other-vfo` returns it as `("VFOB" 7074000 "USB")`.
 
 ### Tuning
 
@@ -287,6 +307,44 @@ of these levels as one 255th, because that is what fits in the byte the radio
 is sent — and four tenths of a percent rounds to the number already on the
 screen, so the key looks broken while working perfectly.
 `ham-rig-percent-step` sets the floor.
+
+### When a control will not change
+
+rigctld answers every change with a return code, and anything but `RPRT 0`
+means the radio was not changed. The panel reports it in the echo area and
+on the control's own line:
+
+```
+    RF                 ########## 100%    0%..100%  not set: timed out waiting for the rig (RPRT -5)
+```
+
+The note stays until a change to that control goes through. A refusal can
+take several seconds to arrive, because Hamlib retries the command before
+giving up. ham-rig waits for that answer even after it has stopped waiting
+for the request, then reads the control again.
+
+The panel sends the levels Hamlib documents (`L RF 0.5` for half RF gain,
+`L PREAMP 10`, `L AGC 2`), so a refusal is usually the rig or the Hamlib
+backend. `rigctl -m <model> -r <port> -vvvvv L RF 0.5` prints the bytes
+Hamlib sends, which settles which one it is.
+
+**Hamlib 4.5.x with an FTDX10.** Checked against 4.5.5 and 4.7.2, driven by
+the same simulated FTDX10:
+
+| Control | 4.5.x | 4.6 and later |
+|---|---|---|
+| RF gain | Never set. The command goes out as `RG`, cut short by a NUL byte where the VFO digit belongs, and the radio refuses it (`RPRT -5`). | `RG0nnn;` |
+| Monitor level | Set out of 100 but read back out of 255: set 50%, read 20%. Each press moves it further down. | Correct. |
+| NB level | 1 to 10 are all sent as 10, and read back as 1. | Correct. |
+| VOX delay | Set correctly, read back as a tenth of the value. | Correct. |
+
+Upgrading Hamlib fixes all four. The Windows installer is at
+[hamlib.github.io](https://hamlib.github.io/).
+
+One more is unconfirmed. For the speech processor (the `COMP` switch, not
+the `COMP` level), every version checked sends an FTDX10 `PR1;`, where its
+sibling models get `PR01;`. If that switch reports `not set`, that is the
+likely cause.
 
 ### Filter width
 
@@ -1111,7 +1169,8 @@ argued about.
 | --- | --- | --- |
 | `ham-rig-host` `ham-rig-port` | `localhost` `4532` | Where `rigctld` listens |
 | `ham-rig-fast-interval` | `0.2` | Seconds between frequency, PTT and meter polls |
-| `ham-rig-slow-interval` | `1.0` | Seconds between mode, VFO and split polls |
+| `ham-rig-slow-interval` | `1.0` | Seconds between mode, VFO, split and other-VFO polls |
+| `ham-rig-show-other-vfo` | `auto` | Show the other VFO: when readable directly, always, or never |
 | `ham-rig-tx-timeout` | `180` | Watchdog unkey when the duration is unknown |
 | `ham-rig-tx-timeout-max` | `600` | Ceiling on the watchdog, whatever is declared |
 | `ham-rig-tx-watchdog-margin` | `1.25` | Allowance over a declared duration |
@@ -1216,8 +1275,8 @@ replaces the handler. Handlers run synchronously from a process filter and must
 not block; one that signals an error cannot affect the others.
 
 To read state directly: `ham-rig-frequency`, `ham-rig-current-mode`,
-`ham-rig-ptt-p`, `ham-rig-connected-p`, `ham-rig-power-state`, and
-`ham-rig-get` for the rest.
+`ham-rig-other-vfo`, `ham-rig-ptt-p`, `ham-rig-connected-p`,
+`ham-rig-power-state`, and `ham-rig-get` for the rest.
 
 `ham-spacewx` publishes on `ham-spacewx-updated` with the source key and its
 payload, and offers `ham-spacewx-kp`, `ham-spacewx-solar-flux`,

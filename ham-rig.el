@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.2.3
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1") (ham "0.5.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -70,6 +70,7 @@
 ;;   +m              get_mode:            Mode: USB / Passband: 2400
 ;;   +v              get_vfo:             VFO: VFOA
 ;;   +s              get_split_vfo:       Split: 0 / TX VFO: VFOA
+;;   +\get_vfo_info VFOB                  Freq: 7074000 / Mode: USB / ...
 ;;   +l STRENGTH     get_level: STRENGTH  -48
 ;;   +\chk_vfo       (no echo)            ChkVFO: 0
 ;;   +\dump_caps     dump_caps:           Model name:<TAB>Dummy
@@ -122,6 +123,22 @@ give and will only add latency."
 (defcustom ham-rig-slow-interval 1.0
   "Seconds between slow tier polls: mode, VFO, split, SWR, ALC."
   :type 'number
+  :group 'ham-rig)
+
+(defcustom ham-rig-show-other-vfo 'auto
+  "Whether the panel shows the other VFO beneath the main frequency.
+
+The other VFO is VFO B while you are on A, and A while you are on B; on
+a rig with two receivers it is Sub or Main.  It is read once a slow
+poll.
+
+`auto' shows it when the rig can read a VFO without switching to it,
+which Hamlib reports as a targetable frequency.  On a rig that cannot,
+every reading would flip the radio to the other VFO and back, once a
+second, so `auto' leaves it off.  t shows it regardless; nil never."
+  :type '(choice (const :tag "When the rig can read it directly" auto)
+                 (const :tag "Always" t)
+                 (const :tag "Never" nil))
   :group 'ham-rig)
 
 (defcustom ham-rig-request-timeout 2.0
@@ -440,6 +457,9 @@ would collide on the keys Type, Label and Values.")
   "Cached level values, keyed by Hamlib level name.")
 (defvar ham-rig--funcs (make-hash-table :test #'equal)
   "Cached function states, keyed by Hamlib function name.")
+(defvar ham-rig--control-failures (make-hash-table :test #'equal)
+  "Why the last change to a control failed, keyed by control name.
+An entry is removed when a later change to that control succeeds.")
 (defvar ham-rig--controls-dirty nil)
 (defvar ham-rig--controls-cursor 0)
 (defvar ham-rig--controls-last-render nil)
@@ -457,8 +477,17 @@ that has already been dispatched cannot act on a later transmission.")
 (defvar ham-rig--unkey-timer nil)
 (defvar ham-rig--tx-started-at nil)
 (defvar ham-rig--unkey-on-reconnect nil)
-(defvar ham-rig--owed 0
-  "How many replies are still owed for requests that timed out.")
+(defvar ham-rig--other-vfo-unavailable nil
+  "Non-nil once rigctld has said it cannot describe a VFO.")
+(defvar ham-rig--owed nil
+  "Replies still owed for requests that timed out, oldest first.
+
+Each element is what to do with that reply when it finally arrives: a
+function to call with its return code, or nil to throw it away.  Almost
+everything is thrown away, since a late reading is a stale one.  A
+change is the exception, because whether the rig took it is still
+worth knowing -- and a change the rig refuses is the request most
+likely to be late, since Hamlib retries it before giving up.")
 (defun ham-rig--fresh-stats ()
   "Return a zeroed link statistics plist.
 One definition, so that a caller building its own cannot leave out a
@@ -470,7 +499,7 @@ key and make an increment fail inside a process filter."
 
 (cl-defstruct (ham-rig--request (:constructor ham-rig--request-create)
                                 (:copier nil))
-  command callback kind sent-at terminator)
+  command callback kind sent-at terminator late)
 
 (cl-defstruct (ham-rig-response (:constructor ham-rig--response-create)
                                 (:copier nil))
@@ -563,10 +592,13 @@ Like `ham-rig--num' but never falls back to an unlabelled value."
 
 ;;;; Request queue
 
-(defun ham-rig--enqueue (command &optional callback kind terminator)
+(defun ham-rig--enqueue (command &optional callback kind terminator late)
   "Queue COMMAND, calling CALLBACK with a `ham-rig-response'.
 KIND is `poll' or `user'.  Poll requests are dropped when the queue is
 backed up; user requests are always queued.
+
+LATE, if given, is called with the return code should the reply turn
+up after the request has been given up on; see `ham-rig--owed'.
 
 TERMINATOR is an optional regexp matching a line that ends the response
 in place of RPRT.  It exists for `\\chk_vfo', which rigctld answers
@@ -582,7 +614,7 @@ until it timed out, delaying everything queued behind it."
             (append ham-rig--queue
                     (list (ham-rig--request-create
                            :command command :callback callback :kind kind
-                           :terminator terminator))))
+                           :terminator terminator :late late))))
       (ham-rig--pump))))
 
 (defun ham-rig--enqueue-urgent (command &optional callback match)
@@ -644,7 +676,9 @@ a frequency, or a mode."
     ;; all, so there would be nothing to discard and counting it would
     ;; swallow the next reply instead.
     (unless (ham-rig--request-terminator ham-rig--inflight)
-      (cl-incf ham-rig--owed))
+      (setq ham-rig--owed
+            (append ham-rig--owed
+                    (list (ham-rig--request-late ham-rig--inflight)))))
     (setq ham-rig--inflight nil
           ham-rig--resp-lines nil)))
 
@@ -686,13 +720,16 @@ belongs to those and is thrown away, one whole response per RPRT, until
 the stream has caught up with us again."
   (cond
    ((string-match "\\`RPRT \\(-?[0-9]+\\)" line)
-    (if (> ham-rig--owed 0)
-        (progn
-          (cl-decf ham-rig--owed)
-          (cl-incf (plist-get ham-rig--stats :discarded))
-          (setq ham-rig--resp-lines nil))
-      (ham-rig--complete (string-to-number (match-string 1 line)))))
-   ((> ham-rig--owed 0) nil)
+    (let ((rc (string-to-number (match-string 1 line))))
+      (if ham-rig--owed
+          (let ((late (pop ham-rig--owed)))
+            (cl-incf (plist-get ham-rig--stats :discarded))
+            (setq ham-rig--resp-lines nil)
+            (when late
+              (with-demoted-errors "ham-rig: late reply error: %S"
+                (funcall late rc))))
+        (ham-rig--complete rc))))
+   (ham-rig--owed nil)
    ((ham-rig--terminator-p line)
     (push line ham-rig--resp-lines)
     (ham-rig--complete 0))
@@ -790,11 +827,16 @@ also carrying frequency and PTT."
           (ham-rig--read-control control 'poll))))))
 
 (defun ham-rig--poll-slow ()
-  "Poll mode, VFO, split and, while transmitting, SWR and ALC."
+  "Poll mode, VFO, split and the other VFO, then a few controls."
   (when (ham-rig--should-poll-p)
     (ham-rig--enqueue "m" #'ham-rig--note-mode 'poll)
     (ham-rig--enqueue
-     "v" (lambda (r) (ham-rig--set 'vfo (ham-rig--labelled-val r "VFO")))
+     "v" (lambda (r)
+           (ham-rig--set 'vfo (ham-rig--labelled-val r "VFO"))
+           ;; Asked from here rather than alongside, because which VFO is
+           ;; the other one is only known once this answer is in.  Queued
+           ;; beside it, a swap at the radio asked for the wrong one.
+           (ham-rig--read-other-vfo 'poll))
      'poll)
     (ham-rig--enqueue
      "s" (lambda (r)
@@ -903,7 +945,7 @@ Consume any duration declared by `ham-rig-expect-transmission\='."
         ;; wrong request.
         (ham-rig--abandon-inflight)
         (when (ham-connection-send ham-rig--connection "+T 0")
-          (cl-incf ham-rig--owed))
+          (setq ham-rig--owed (append ham-rig--owed (list nil))))
         (ham-rig--verify-unkey 1)
         (message "ham-rig: unkeying"))
     (setq ham-rig--unkey-on-reconnect t)
@@ -980,11 +1022,14 @@ attempts to unkey it. Unkey it at the front panel now."
   (pcase state
     ('connected
      (setq ham-rig--inflight nil ham-rig--queue nil ham-rig--resp-lines nil
-           ham-rig--owed 0)
+           ham-rig--owed nil)
      ;; Anything cached from a previous session describes a rig that may
      ;; no longer be the one on the other end of the port.
      (clrhash ham-rig--levels)
      (clrhash ham-rig--funcs)
+     (clrhash ham-rig--control-failures)
+     (setq ham-rig--other-vfo-unavailable nil)
+     (remhash 'other-vfo ham-rig--state)
      (setq ham-rig--controls-dirty t ham-rig--controls-last-render nil)
      (when (or ham-rig--unkey-on-reconnect (ham-rig-ptt-p))
        (setq ham-rig--unkey-on-reconnect nil)
@@ -1060,7 +1105,7 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
   (ham-rig--cancel-unkey-verification)
   (when ham-rig--connection (ham-connection-close ham-rig--connection))
   (setq ham-rig--connection nil ham-rig--queue nil ham-rig--inflight nil
-        ham-rig--owed 0)
+        ham-rig--owed nil)
   (ham-rig--schedule-redisplay)
   (message "ham-rig: disconnected"))
 
@@ -1201,14 +1246,15 @@ plain prefix matching would let \"l RFPOWER\" also discard a queued
                                 (string-prefix-p space queued))))
                         ham-rig--queue))))
 
-(defun ham-rig--enqueue-latest (match command &optional callback)
+(defun ham-rig--enqueue-latest (match command &optional callback late)
   "Queue COMMAND, first dropping any queued request that MATCH supersedes.
+CALLBACK and LATE are as for `ham-rig--enqueue'.
 
 Adjusting a control generates a request per keypress and only the last
 one matters.  A held-down key would otherwise pile up hundreds of sets
 that the link has to work through long after the operator stopped."
   (ham-rig--supersede match)
-  (ham-rig--enqueue command callback))
+  (ham-rig--enqueue command callback nil nil late))
 
 (defun ham-rig-tuning-step ()
   "Return the current tuning step in Hz."
@@ -1430,7 +1476,92 @@ leaves the toggle stuck on one VFO from the second press onwards."
   (let ((target (if (eq (ham-rig--vfo-side (ham-rig-get 'vfo)) 'b)
                     "VFOA" "VFOB")))
     (ham-rig--enqueue (format "V %s" target))
-    (ham-rig--enqueue "v" (lambda (r) (ham-rig--set 'vfo (ham-rig--labelled-val r "VFO"))))))
+    (ham-rig--enqueue
+     "v" (lambda (r)
+           (ham-rig--set 'vfo (ham-rig--labelled-val r "VFO"))
+           ;; Only now is it known which VFO is the other one.
+           (ham-rig--read-other-vfo)))))
+
+
+;;;; The other VFO
+
+(defun ham-rig--vfo-list ()
+  "Return the VFO names the rig reports, as Hamlib spells them."
+  (split-string (or (ham-rig--caps-value "VFO list") "") "[ \t]+" t))
+
+(defun ham-rig--other-vfo-name ()
+  "Return the name of the VFO not in use, or nil if the rig has none.
+
+The rig's own list decides the spelling.  Hamlib answers a name it does
+not recognise with the current VFO rather than an error, so asking for
+VFOB on a rig that calls it Sub would show the main frequency twice
+under two names."
+  (let* ((names (ham-rig--vfo-list))
+         (current (ham-rig-get 'vfo))
+         (receivers (and current
+                         (let ((case-fold-search t))
+                           (string-match-p "\\`\\(main\\|sub\\)" current))))
+         (candidates
+          (if (eq (ham-rig--vfo-side current) 'b)
+              (if receivers '("Main" "VFOA") '("VFOA" "Main"))
+            (if receivers '("Sub" "VFOB") '("VFOB" "Sub")))))
+    (cl-find-if (lambda (name) (member name names)) candidates)))
+
+(defun ham-rig--targetable-frequency-p ()
+  "Return non-nil if the rig can read a VFO's frequency without selecting it.
+
+Hamlib 4.6 and later list what can be targeted; 4.5 says only whether
+anything can.  An FTDX10 answers Y to the second and FREQ is on its list
+in the first."
+  (let ((features (ham-rig--caps-value "Targetable features")))
+    (if features
+        (member "FREQ" (split-string features "[ \t]+" t))
+      (equal (string-trim (or (ham-rig--caps-value "Has targetable VFO") ""))
+             "Y"))))
+
+(defun ham-rig--other-vfo-wanted-p ()
+  "Return non-nil if the other VFO should be read and shown."
+  (and ham-rig-show-other-vfo
+       ham-rig--caps
+       (not ham-rig--other-vfo-unavailable)
+       (ham-rig--other-vfo-name)
+       (or (eq ham-rig-show-other-vfo t)
+           (ham-rig--targetable-frequency-p))
+       t))
+
+(defun ham-rig--note-other-vfo (name response)
+  "Store what RESPONSE reports about the VFO called NAME."
+  (let ((rc (ham-rig-response-rc response)))
+    (cond
+     ;; No such command, which is rigctld before 4.1: stop asking.  A
+     ;; timeout is left alone, since the next poll may well get through.
+     ((memq rc '(-1 -4 -11))
+      (setq ham-rig--other-vfo-unavailable t
+            ham-rig--dirty t)
+      (ham-rig--schedule-redisplay))
+     ((zerop rc)
+      (let ((hz (ham-rig--labelled-num response "Freq")))
+        (ham-rig--set 'other-vfo
+                      (and hz (list name (round hz)
+                                    (ham-rig--labelled-val response "Mode")))))))))
+
+(defun ham-rig--read-other-vfo (&optional kind)
+  "Queue a reading of the other VFO, if it is wanted.
+KIND is `poll' for the slow tier; otherwise any reading already queued
+is superseded."
+  (when (ham-rig--other-vfo-wanted-p)
+    (let* ((name (ham-rig--other-vfo-name))
+           (command (format "\\get_vfo_info %s" name))
+           (callback (lambda (r) (ham-rig--note-other-vfo name r))))
+      (if (eq kind 'poll)
+          (ham-rig--enqueue command callback 'poll)
+        (ham-rig--enqueue-latest "\\get_vfo_info" command callback)))))
+
+(defun ham-rig-other-vfo ()
+  "Return the other VFO as (NAME HZ MODE), or nil if it is not known.
+NAME is Hamlib's name for it, such as \"VFOB\" or \"Sub\"."
+  (let ((info (ham-rig-get 'other-vfo)))
+    (and info (equal (car info) (ham-rig--other-vfo-name)) info)))
 
 (defun ham-rig-toggle-tuner ()
   "Switch the antenna tuner in or out.
@@ -1712,6 +1843,29 @@ two things to keep in step, and a chance for them to disagree."
     (concat (propertize (or model "Rig") 'face 'ham-face-label)
             "  " where "  " shown)))
 
+(defun ham-rig--render-other-vfo ()
+  "Return the line showing the other VFO, or \"\" if there is none.
+
+In ordinary text beneath the main frequency, which stays the large one:
+that is the VFO the receiver is on.  It carries its own name, since
+after a swap the line underneath is VFO A.  In split, the VFO that
+transmits is marked TX."
+  (if (not (ham-rig--other-vfo-wanted-p))
+      ""
+    (let* ((name (ham-rig--other-vfo-name))
+           (info (ham-rig-other-vfo))
+           (hz (nth 1 info))
+           (band (and hz (ham-band-for-frequency hz)))
+           (tx (and (ham-rig-get 'split)
+                    (eq (ham-rig--vfo-side (ham-rig-get 'split-vfo))
+                        (ham-rig--vfo-side name)))))
+      (concat "\n" ham-panel-indent
+              (if hz (ham-format-frequency hz) "---.---.---")
+              "   " (propertize (format "%-4s" (or band "")) 'face 'ham-rig-label)
+              "   " (propertize name 'face 'ham-rig-label)
+              " " (or (nth 2 info) "")
+              (if tx (concat "  " (propertize "TX" 'face 'ham-rig-tx)) "")))))
+
 (defun ham-rig--render ()
   "Return the panel contents as a string."
   (let* ((freq (ham-rig-frequency))
@@ -1731,6 +1885,7 @@ two things to keep in step, and a chance for them to disagree."
        (if (>= step 1000)
            (format "%g k" (/ step 1000.0))
          (format "%d " step)))
+     (ham-rig--render-other-vfo)
      "\n\n  "
      (propertize "VFO " 'face 'ham-rig-label)
      (format "%-6s" (or (ham-rig-get 'vfo) "--"))
@@ -2296,6 +2451,82 @@ nothing."
       (max low (min high value)))
      (t value))))
 
+(defconst ham-rig--hamlib-errors
+  '((1 . "invalid parameter")
+    (2 . "invalid configuration")
+    (3 . "out of memory")
+    (4 . "not implemented in Hamlib")
+    (5 . "timed out waiting for the rig")
+    (6 . "input/output error")
+    (7 . "internal Hamlib error")
+    (8 . "protocol error")
+    (9 . "rejected by the rig")
+    (10 . "argument truncated")
+    (11 . "not available on this rig")
+    (12 . "VFO not targetable")
+    (13 . "bus error")
+    ;; What the Yaesu backend returns when the radio keeps answering
+    ;; "?;", which it does for a command it did not understand as well
+    ;; as when it is busy.
+    (14 . "the rig kept answering busy or did not understand the command")
+    (15 . "invalid argument")
+    (16 . "invalid VFO")
+    (17 . "argument out of range")
+    (18 . "deprecated")
+    (19 . "security error")
+    (20 . "rig not powered on"))
+  "Hamlib's error codes, from `enum rig_errcode_e\\=' in rig.h.
+rigctld reports them negated, as RPRT -5 for a timeout.")
+
+(defun ham-rig--describe-rc (rc)
+  "Return a short description of Hamlib return code RC."
+  (or (cdr (assq (abs rc) ham-rig--hamlib-errors))
+      (format "error %d" rc)))
+
+(defun ham-rig--note-write-result (control value rc)
+  "Record how the change of CONTROL to VALUE went, from return code RC.
+
+rigctld answers every set with RPRT, and anything but RPRT 0 means the
+rig was not changed.  Without looking at it, a refused change showed
+on the panel for as long as it took the read that follows to bring the
+old value back, and then quietly reverted -- which looks exactly like
+the panel being broken, when the panel was the one part working."
+  (let ((name (ham-rig--control-name control)))
+    (if (zerop rc)
+        (when (gethash name ham-rig--control-failures)
+          (remhash name ham-rig--control-failures)
+          (setq ham-rig--controls-dirty t)
+          (ham-rig--schedule-controls-redisplay))
+      (let ((why (format "%s (RPRT %d)" (ham-rig--describe-rc rc) rc)))
+        (puthash name why ham-rig--control-failures)
+        (setq ham-rig--controls-dirty t)
+        (ham-rig--schedule-controls-redisplay)
+        (message "ham-rig: %s was not set to %s: %s"
+                 (ham-rig--control-label control)
+                 (if (eq (ham-rig--control-kind control) 'func)
+                     (if value "on" "off")
+                   (ham-rig--format-level control value))
+                 why)))))
+
+(defun ham-rig--send-control (control value match command)
+  "Send COMMAND to set CONTROL to VALUE, superseding MATCH.
+
+The outcome is noted however long it takes to arrive.  Hamlib retries a
+command the radio rejects before admitting defeat -- about eight
+seconds, for an FTDX10 refusing a level -- which is well past
+`ham-rig-request-timeout'.  So the answer that matters most is the one
+most likely to come after the request has been given up on, and it is
+kept for, rather than thrown away with the stale readings.  Arriving
+that late, it also follows a read-back that could not have seen the
+outcome, so the control is read once more."
+  (ham-rig--enqueue-latest
+   match command
+   (lambda (r)
+     (ham-rig--note-write-result control value (ham-rig-response-rc r)))
+   (lambda (rc)
+     (ham-rig--note-write-result control value rc)
+     (ham-rig--read-control control nil t))))
+
 (defun ham-rig--write-control (control value)
   "Send VALUE for CONTROL, then read it back to see what the rig did."
   (unless (ham-rig-connected-p)
@@ -2304,18 +2535,18 @@ nothing."
     (if (eq (ham-rig--control-kind control) 'func)
         (progn
           (ham-rig--set-control-value control (and value t))
-          (ham-rig--enqueue-latest (format "U %s" name)
-                                   (format "U %s %d" name (if value 1 0))))
+          (ham-rig--send-control control value (format "U %s" name)
+                                 (format "U %s %d" name (if value 1 0))))
       (let ((clamped (ham-rig--acceptable-value control value)))
         (ham-rig--set-control-value control clamped)
         (if (eq (ham-rig--control-kind control) 'width)
             ;; Sent as a mode change, carrying the mode the rig is
             ;; already in, because that is the only way Hamlib sets it.
             (when-let ((mode (ham-rig-current-mode)))
-              (ham-rig--enqueue-latest
-               "M" (format "M %s %d" mode (round clamped))))
-          (ham-rig--enqueue-latest
-           (format "L %s" name)
+              (ham-rig--send-control control clamped "M"
+                                     (format "M %s %d" mode (round clamped))))
+          (ham-rig--send-control
+           control clamped (format "L %s" name)
            (format "L %s %s" name
                    (if (ham-rig--control-integral-p control)
                        (format "%d" (round clamped))
@@ -2403,7 +2634,14 @@ stare at a screen of dashes."
                   (format "%s..%s"
                           (ham-rig--format-level control min t)
                           (ham-rig--format-level control max t)))
-                'face 'ham-rig-label))))))
+                'face 'ham-rig-label)))))
+         (failure (gethash (ham-rig--control-name control)
+                           ham-rig--control-failures)))
+    ;; Left on the line until a change goes through, so that a control
+    ;; the rig will not take says so rather than just not moving.
+    (when failure
+      (setq line (concat line (propertize (concat "  not set: " failure)
+                                          'face 'ham-face-warn))))
     (propertize (concat line "\n") 'ham-rig-control control)))
 
 (defun ham-rig--render-controls ()
