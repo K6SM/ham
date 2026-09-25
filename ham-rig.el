@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 K6SM
 
 ;; Author: K6SM
-;; Version: 0.3.0
+;; Version: 0.3.4
 ;; Package-Requires: ((emacs "29.1") (ham "0.5.0"))
 ;; Keywords: comm, hardware
 ;; URL: https://github.com/K6SM/ham
@@ -371,6 +371,93 @@ the rig, and only the words for them are local to a model."
                 :value-type (alist :key-type number :value-type string))
   :group 'ham-rig)
 
+(defcustom ham-rig-manufacturer-value-labels
+  '(("Yaesu" ("PREAMP" (0 . "IPO") (10 . "AMP1") (20 . "AMP2"))))
+  "Names for control values by manufacturer.
+Each entry is (MFG (HAMLIB-NAME (VALUE . LABEL)...)...).
+
+MFG is matched against the `Mfg name\\=' the rig reports.  Consulted
+after `ham-rig-control-value-labels\\=', which wins.  Yaesu marks its
+preamp positions IPO, AMP1 and AMP2 across the range; Hamlib calls them
+0, 10 and 20 dB."
+  :type '(alist :key-type string
+                :value-type (alist :key-type string
+                                   :value-type (alist :key-type number
+                                                      :value-type string)))
+  :group 'ham-rig)
+
+(defcustom ham-rig-model-control-values
+  '(("FTDX-10" ("ROOFINGFILTER" (1 . "12 kHz") (2 . "3 kHz")
+                (4 . "500 Hz") (5 . "300 Hz"))))
+  "Positions for a control on a particular model, replacing Hamlib's.
+Each entry is (MODEL (HAMLIB-NAME (VALUE . LABEL)...)...), MODEL being
+the `Model name\\=' the rig reports.
+
+This is for a backend whose published list does not match what it
+sends.  Hamlib's FTDX10 roofing filter table was adapted from the
+FTDX101's, which has a 1.2 kHz filter between 3 kHz and 600 Hz.  The
+FTDX10 has none, so its codes skip 3 -- 500 Hz is 4 and 300 Hz is 5 --
+but the names it publishes do not skip, and call 3 \"500 Hz\" and 4
+\"300 Hz\".  Choosing 500 Hz from those selected 300 Hz, and the radio
+on its 500 Hz filter read as 300 Hz.  Nor does the radio ever report
+AUTO, which the published list offers first.
+
+The entry here is the FTDX10's four filters under the codes Hamlib
+actually sends and reads, with the right names."
+  :type '(alist :key-type string
+                :value-type (alist :key-type string
+                                   :value-type (alist :key-type number
+                                                      :value-type string)))
+  :group 'ham-rig)
+
+(defcustom ham-rig-model-raw-functions
+  '(("FTDX-10" ("COMP" :read "PR0;" :on "PR02;" :off "PR01;")))
+  "Switches read and set with raw CAT commands on a particular model.
+Each entry is (MODEL (HAMLIB-NAME :read QUERY :on SET-ON :off SET-OFF)...),
+MODEL being the `Model name\=' the rig reports.  The rig's answer to
+QUERY is compared with SET-ON and SET-OFF, since a Yaesu answers with
+the same text it is set with.
+
+This is for a switch Hamlib sends the wrong command for, and it goes
+through rigctld's `W\=' command, so nothing else needs the serial port.
+
+Hamlib sends an FTDX10 PR1; and PR; for the speech processor, which it
+answers ?; to.  Yaesu's FTDX10 CAT reference (2308-F) gives PR, then
+P1 -- 0 the speech processor, 1 the parametric microphone equaliser --
+then P2, 1 for OFF and 2 for ON; read with PR0; and answered in the same
+form.  PR1; is P1 alone, the equaliser with no state, and PR; is a read
+with no P1.  The commands here are the manual's."
+  :type '(alist :key-type string
+                :value-type (alist :key-type string
+                                   :value-type (plist :key-type symbol
+                                                      :value-type string)))
+  :group 'ham-rig)
+
+(defcustom ham-rig-panel-indicators
+  '(("PREAMP") ("ATT" . "ATT") ("ROOFINGFILTER" . "ROOF") ("AGC" . "AGC"))
+  "Settings shown on the rig panel, as (HAMLIB-NAME . LABEL), in order.
+
+The receive front end, as a radio's own display shows it.  One the rig
+does not have is left out.  Each is shown as LABEL and the value, as ATT
+6 dB or AGC AUTO.  With no LABEL, a value that has a name is shown
+alone, the way a Yaesu shows IPO or AMP1 with nothing beside it, and a
+value without one gets the control's own name.  Any other level or
+function the controls panel lists can be added, (\"NB\" . \"NB\") for
+example."
+  :type '(alist :key-type string
+                :value-type (choice (const :tag "Named values alone" nil)
+                                    string))
+  :group 'ham-rig)
+
+(defcustom ham-rig-indicator-poll-batch 2
+  "How many of the panel's indicators are read on each slow poll.
+
+They change only when somebody changes them, so they are read in turn
+rather than all at once, and a change made here is read back at once.
+A change made at the radio shows within a few seconds."
+  :type 'integer
+  :group 'ham-rig)
+
 
 ;;;; Faces
 
@@ -458,8 +545,9 @@ would collide on the keys Type, Label and Values.")
 (defvar ham-rig--funcs (make-hash-table :test #'equal)
   "Cached function states, keyed by Hamlib function name.")
 (defvar ham-rig--control-failures (make-hash-table :test #'equal)
-  "Why the last change to a control failed, keyed by control name.
-An entry is removed when a later change to that control succeeds.")
+  "Why the last change to a control failed.
+Keyed by `ham-rig--failure-key\=', and removed when a later change to
+that control succeeds.")
 (defvar ham-rig--controls-dirty nil)
 (defvar ham-rig--controls-cursor 0)
 (defvar ham-rig--controls-last-render nil)
@@ -717,7 +805,18 @@ the commands rigctld answers without one.
 
 While replies are owed for requests that timed out, everything arriving
 belongs to those and is thrown away, one whole response per RPRT, until
-the stream has caught up with us again."
+the stream has caught up with us again.
+
+A NUL inside LINE is taken as a line break.  Hamlib 4.7 ends the reply
+to a raw CAT command with one rather than a newline, which puts its
+RPRT on the same line as the reply, where nothing looking for RPRT at
+the start of a line would see it."
+  (if (string-search "\0" line)
+      (mapc #'ham-rig--on-line (split-string line "\0" t))
+    (ham-rig--on-whole-line line)))
+
+(defun ham-rig--on-whole-line (line)
+  "Handle LINE, one without a NUL, as `ham-rig--on-line\=' describes."
   (cond
    ((string-match "\\`RPRT \\(-?[0-9]+\\)" line)
     (let ((rc (string-to-number (match-string 1 line))))
@@ -827,7 +926,7 @@ also carrying frequency and PTT."
           (ham-rig--read-control control 'poll))))))
 
 (defun ham-rig--poll-slow ()
-  "Poll mode, VFO, split and the other VFO, then a few controls."
+  "Poll mode, VFO, split, the other VFO and a few indicators and controls."
   (when (ham-rig--should-poll-p)
     (ham-rig--enqueue "m" #'ham-rig--note-mode 'poll)
     (ham-rig--enqueue
@@ -843,7 +942,8 @@ also carrying frequency and PTT."
            (ham-rig--set 'split-vfo (ham-rig--labelled-val r "TX VFO"))
            (let ((v (ham-rig--labelled-val r "Split")))
              (ham-rig--set 'split (and v (not (equal v "0"))))))
-     'poll))
+     'poll)
+    (ham-rig--read-indicators ham-rig-indicator-poll-batch))
   (ham-rig--poll-controls))
 
 (defun ham-rig--start-timers ()
@@ -1077,6 +1177,10 @@ does not yet pass explicit VFO arguments. Restart rigctld without -o."
      (setq ham-rig--caps (ham-rig-response-alist r))
      (setq ham-rig--caps-raw (ham-rig-response-raw r))
      (setq ham-rig--dirty t ham-rig--controls-dirty t)
+     ;; Nor can the panel's indicators, which otherwise wait their turn
+     ;; in the round robin and show dashes for several seconds.
+     (when (ham-rig-connected-p)
+       (ham-rig--read-indicators))
      ;; The controls panel cannot know what to show until the rig has
      ;; described itself, so fill it as soon as it has.
      (when (and (ham-rig--controls-visible-p) (ham-rig-connected-p))
@@ -1662,6 +1766,7 @@ rig still listens while off, and at the radio if it does not."
   (interactive)
   (ham-rig--poll-fast)
   (ham-rig--poll-slow)
+  (ham-rig--read-indicators)
   (setq ham-rig--dirty t ham-rig--last-render nil)
   (ham-rig--schedule-redisplay))
 
@@ -1814,6 +1919,122 @@ Some meters are shown as a bar alone; see `ham-rig-meters-without-value'."
                  (if (string-empty-p reading) "" (concat "  " reading))))))
    (ham-rig--tx-meters) ""))
 
+;;;; Panel indicators
+
+(defvar ham-rig--indicator-cursor 0
+  "Where the round robin over the panel's indicators has got to.")
+
+(defun ham-rig--find-control (name)
+  "Return the control called NAME, or nil if the rig has none."
+  (cl-find name (ham-rig--control-list)
+           :key #'ham-rig--control-name :test #'equal))
+
+(defun ham-rig--indicators ()
+  "Return the panel's indicators this rig has, as (CONTROL . LABEL)."
+  (let ((controls (ham-rig--control-list)))
+    (cl-loop for (name . label) in ham-rig-panel-indicators
+             for control = (cl-find name controls
+                                    :key #'ham-rig--control-name :test #'equal)
+             when control collect (cons control label))))
+
+(defun ham-rig--indicator-controls ()
+  "Return every control that has a setting on the panel, the tuner too."
+  (let ((tuner (ham-rig--find-control "TUNER")))
+    (append (mapcar #'car (ham-rig--indicators))
+            (and tuner (list tuner)))))
+
+(defun ham-rig--read-indicators (&optional batch)
+  "Queue a read of each indicator on the panel.
+With BATCH, read only that many, carrying on round robin from where the
+last call stopped, as polls; otherwise read them all now."
+  (let* ((controls (ham-rig--indicator-controls))
+         (total (length controls)))
+    (when (> total 0)
+      (if batch
+          (dotimes (_ (min batch total))
+            (ham-rig--read-control
+             (nth (mod ham-rig--indicator-cursor total) controls) 'poll)
+            (cl-incf ham-rig--indicator-cursor))
+        (mapc #'ham-rig--read-control controls)))))
+
+(defun ham-rig--indicator-text (control label)
+  "Return the panel text for the current setting of CONTROL, under LABEL."
+  (ham-rig--indicator-text-for control label (ham-rig--control-value control)))
+
+(defun ham-rig--indicator-widest (control label)
+  "Return the widest CONTROL's indicator can be, under LABEL, in columns.
+
+Its column is sized to that rather than to what it shows now, so that
+switching the tuner on, or the AGC from FAST to MEDIUM, does not shift
+everything to its right."
+  (apply #'max
+         (mapcar (lambda (value)
+                   (string-width (ham-rig--indicator-text-for control label value)))
+                 (if (eq (ham-rig--control-kind control) 'func)
+                     '(unknown nil t)
+                   (cons (ham-rig--control-value control)
+                         (cons nil (ham-rig--control-discrete-values control)))))))
+
+(defun ham-rig--indicator-text-for (control label value)
+  "Return the panel text for VALUE of CONTROL, under LABEL.
+
+A function is ON or OFF, and anything else is LABEL and the value, as
+ATT 6 dB or AGC AUTO.  With LABEL nil, a value that has a name is shown
+alone, the way a Yaesu shows IPO, and one without gets the control's
+own name.  A note in brackets after a name, as in Hamlib's \"300 Hz
+\(optional)\", is left to the controls panel: here it would only widen
+the column."
+  (let ((prefix (propertize (concat (or label (ham-rig--control-label control))
+                                    " ")
+                            'face 'ham-rig-label)))
+    (cond
+     ((eq (ham-rig--control-kind control) 'func)
+      (concat prefix
+              (pcase value
+                ('unknown "--")
+                ('nil "OFF")
+                (_ (propertize "ON" 'face 'ham-rig-rx)))))
+     ((and (null label) value (ham-rig--control-value-label control value)))
+     (t
+      (concat prefix
+              (if (null value)
+                  "--"
+                (let ((text (replace-regexp-in-string
+                             " *([^)]*)\\'" ""
+                             (ham-rig--format-level control value))))
+                  (if (equal text "off") "OFF" text))))))))
+
+(defun ham-rig--align-rows (rows &optional sizes gap)
+  "Return ROWS, lists of cells, as lines with their columns aligned.
+
+Each column is as wide as its widest cell.  SIZES, when given, are more
+rows of the same shape, of numbers or strings, counted in the widths but
+not drawn: the widest each cell could ever be, so that the columns stay
+where they are as the values change.  GAP spaces, three by default,
+separate one column from the next.  Rows may be of different lengths; a
+short one simply ends early.  Every cell is padded, the last included,
+so that whatever follows a row starts in the same column on each."
+  (let* ((gap (make-string (or gap 3) ?\s))
+         (all (append rows sizes))
+         (width-of (lambda (cell)
+                     (if (numberp cell) cell (string-width (or cell "")))))
+         (columns (apply #'max 0 (mapcar #'length all)))
+         (widths (cl-loop for i below columns
+                          collect (apply #'max 0
+                                         (mapcar (lambda (row)
+                                                   (funcall width-of (nth i row)))
+                                                 all)))))
+    (mapcar (lambda (row)
+              (mapconcat #'identity
+                         (cl-loop for cell in row
+                                  for width in widths
+                                  collect (concat cell
+                                                  (make-string
+                                                   (- width (string-width cell))
+                                                   ?\s)))
+                         gap))
+            rows)))
+
 (defun ham-rig--status-line ()
   "Return the one line describing the radio link.
 
@@ -1843,61 +2064,99 @@ two things to keep in step, and a chance for them to disagree."
     (concat (propertize (or model "Rig") 'face 'ham-face-label)
             "  " where "  " shown)))
 
-(defun ham-rig--render-other-vfo ()
-  "Return the line showing the other VFO, or \"\" if there is none.
+(defun ham-rig--widest (strings)
+  "Return the width of the widest of STRINGS, or 2 for the dashes of none."
+  (apply #'max 2 (mapcar #'string-width strings)))
 
-In ordinary text beneath the main frequency, which stays the large one:
-that is the VFO the receiver is on.  It carries its own name, since
-after a swap the line underneath is VFO A.  In split, the VFO that
-transmits is marked TX."
-  (if (not (ham-rig--other-vfo-wanted-p))
-      ""
-    (let* ((name (ham-rig--other-vfo-name))
-           (info (ham-rig-other-vfo))
-           (hz (nth 1 info))
-           (band (and hz (ham-band-for-frequency hz)))
-           (tx (and (ham-rig-get 'split)
-                    (eq (ham-rig--vfo-side (ham-rig-get 'split-vfo))
-                        (ham-rig--vfo-side name)))))
-      (concat "\n" ham-panel-indent
-              (if hz (ham-format-frequency hz) "---.---.---")
-              "   " (propertize (format "%-4s" (or band "")) 'face 'ham-rig-label)
-              "   " (propertize name 'face 'ham-rig-label)
-              " " (or (nth 2 info) "")
-              (if tx (concat "  " (propertize "TX" 'face 'ham-rig-tx)) "")))))
+(defun ham-rig--vfo-cells (name mode)
+  "Return the cells that open a frequency line: VFO NAME and MODE."
+  (list (or name "--") (or mode "--")))
 
-(defun ham-rig--render ()
-  "Return the panel contents as a string."
+(defun ham-rig--render-vfos ()
+  "Return the frequency lines: the VFO in use, then the other one.
+
+Each opens with its VFO and mode, in columns, so that the two
+frequencies start one above the other.  The one in use stays on top and
+large whichever VFO it is -- VFO A, or B after a swap -- and the other,
+when the rig can report it, is beneath it in ordinary text.  In split,
+the VFO that transmits is marked TX."
   (let* ((freq (ham-rig-frequency))
-         (band (and freq (ham-band-for-frequency freq)))
-         (tx (ham-rig-ptt-p))
-         (db (ham-rig-get 'strength)))
+         (other (and (ham-rig--other-vfo-wanted-p) (ham-rig--other-vfo-name)))
+         (info (and other (ham-rig-other-vfo)))
+         (other-hz (nth 1 info))
+         (prefixes (ham-rig--align-rows
+                    (cons (ham-rig--vfo-cells (ham-rig-get 'vfo)
+                                              (ham-rig-current-mode))
+                          (and other
+                               (list (ham-rig--vfo-cells other (nth 2 info)))))
+                    ;; Sized for every VFO and mode there is, so that
+                    ;; PKTUSB does not push the frequency along.
+                    (list (list (ham-rig--widest (ham-rig--vfo-list))
+                                (ham-rig--widest (ham-rig--available-modes))))))
+         (tx (and other (ham-rig-get 'split)
+                  (eq (ham-rig--vfo-side (ham-rig-get 'split-vfo))
+                      (ham-rig--vfo-side other)))))
     (concat
-     (ham-panel-header
-      (ham-rig--status-line)
-      "? keys   g refresh   c connect   d disconnect   q bury")
-     ham-panel-indent
+     ham-panel-indent (car prefixes) "   "
      (propertize (if freq (ham-format-frequency freq) "---.---.---")
                  'face 'ham-rig-frequency)
-     "   " (propertize (or band "") 'face 'ham-rig-label)
      (propertize "   STEP " 'face 'ham-rig-label)
      (let ((step (ham-rig-tuning-step)))
        (if (>= step 1000)
            (format "%g k" (/ step 1000.0))
-         (format "%d " step)))
-     (ham-rig--render-other-vfo)
-     "\n\n  "
-     (propertize "VFO " 'face 'ham-rig-label)
-     (format "%-6s" (or (ham-rig-get 'vfo) "--"))
-     (propertize "  MODE " 'face 'ham-rig-label)
-     (format "%-8s" (or (ham-rig-current-mode) "--"))
-     (propertize "  BW " 'face 'ham-rig-label)
-     (format "%-7s" (if-let ((pb (ham-rig-get 'passband)))
-                        (format "%d Hz" pb) "--"))
-     (propertize "  SPLIT " 'face 'ham-rig-label)
-     (if (ham-rig-get 'split)
-         (format "%s" (or (ham-rig-get 'split-vfo) "on"))
-       "off")
+         (format "%d" step)))
+     (when other
+       (concat "\n" ham-panel-indent (cadr prefixes) "   "
+               (if other-hz (ham-format-frequency other-hz) "---.---.---")
+               (if tx (concat "   " (propertize "TX" 'face 'ham-rig-tx)) ""))))))
+
+(defun ham-rig--render-settings ()
+  "Return the settings lines: tuner, width and split, then the front end.
+
+Two rows of one table, so that their columns line up.  The front end is
+what the radio's own display shows beside the frequency -- preamp,
+attenuator, roofing filter and AGC on a Yaesu -- and only what this rig
+has."
+  (let* ((tuner (ham-rig--find-control "TUNER"))
+         (first
+          (delq nil
+                (list
+                 (and tuner (ham-rig--indicator-text tuner "ATU"))
+                 (concat (propertize "BW " 'face 'ham-rig-label)
+                         (if-let ((pb (ham-rig-get 'passband)))
+                             (format "%d Hz" pb) "--"))
+                 (concat (propertize "SPLIT " 'face 'ham-rig-label)
+                         (if (ham-rig-get 'split)
+                             (format "%s" (or (ham-rig-get 'split-vfo) "on"))
+                           "off")))))
+         (second (mapcar (lambda (entry)
+                           (ham-rig--indicator-text (car entry) (cdr entry)))
+                         (ham-rig--indicators))))
+    (mapconcat (lambda (line) (concat ham-panel-indent (string-trim-right line)))
+               (ham-rig--align-rows
+                (if second (list first second) (list first))
+                (list (delq nil
+                            (list (and tuner (ham-rig--indicator-widest tuner "ATU"))
+                                  (string-width "BW 12000 Hz")
+                                  (+ (string-width "SPLIT ")
+                                     (ham-rig--widest
+                                      (cons "off" (ham-rig--vfo-list))))))
+                      (mapcar (lambda (entry)
+                                (ham-rig--indicator-widest (car entry) (cdr entry)))
+                              (ham-rig--indicators))))
+               "\n")))
+
+(defun ham-rig--render ()
+  "Return the panel contents as a string."
+  (let ((tx (ham-rig-ptt-p))
+        (db (ham-rig-get 'strength)))
+    (concat
+     (ham-panel-header
+      (ham-rig--status-line)
+      "? keys   g refresh   c connect   d disconnect   q bury")
+     (ham-rig--render-vfos)
+     "\n\n"
+     (ham-rig--render-settings)
      "\n\n  "
      (if tx
          (concat (propertize "TX" 'face 'ham-rig-tx)
@@ -2122,12 +2381,21 @@ readings out of a panel whose purpose is changing things."
                  (ham-rig--width-control)))
         (funcs (ham-rig--parse-functions
                 (ham-rig--caps-value "Set functions" "Set func")))
-        (ext (ham-rig--ext-levels)))
+        (ext (ham-rig--ext-levels))
+        (corrections (cdr (cl-assoc (string-trim
+                                     (or (ham-rig--caps-value "Model name") ""))
+                                    ham-rig-model-control-values
+                                    :test #'cl-equalp))))
     (cl-remove-if (lambda (control)
                     (or (member (ham-rig--control-name control)
                                 ham-rig-controls-exclude)
                         (ham-rig--control-degenerate-p control)))
-                  (append levels funcs ext))))
+                  (mapcar (lambda (control)
+                            (when-let ((values (cdr (assoc (ham-rig--control-name control)
+                                                           corrections))))
+                              (setf (ham-rig--control-values control) values))
+                            control)
+                          (append levels funcs ext)))))
 
 (defun ham-rig--control-degenerate-p (control)
   "Return non-nil if CONTROL has no usable range and cannot be offered.
@@ -2221,16 +2489,34 @@ list already carries an off position and needs no zero prepended."
                                  collect (string-to-number (match-string 1 token)))))
             (when values (cons 0 (sort (delete 0 values) #'<))))))))))
 
+(defun ham-rig--value-assoc (value alist)
+  "Return the label ALIST gives VALUE, comparing numbers by value.
+The rig may answer 10 or 10.000000 for the same switch position."
+  (cdr (cl-assoc value alist
+                 :test (lambda (a b) (and (numberp a) (numberp b) (= a b))))))
+
+(defun ham-rig--local-value-label (control value)
+  "Return the operator's or the manufacturer's name for VALUE of CONTROL.
+
+These are front-panel words, IPO and AMP1 rather than 0 and 10 dB, and
+stand on their own where the rig's own names need the control's name
+beside them."
+  (let ((name (ham-rig--control-name control))
+        (mfg (string-trim (or (ham-rig--caps-value "Mfg name") ""))))
+    (or (ham-rig--value-assoc value (cdr (assoc name ham-rig-control-value-labels)))
+        (ham-rig--value-assoc
+         value (cdr (assoc name (cdr (cl-assoc mfg ham-rig-manufacturer-value-labels
+                                               :test #'cl-equalp))))))))
+
 (defun ham-rig--control-value-label (control value)
   "Return a name for VALUE of CONTROL, or nil.
 
 `ham-rig-control-value-labels\=' first, since that is the operator\='s own
-word for it, then whatever the rig called it."
-  (or (cdr (assoc value (cdr (assoc (ham-rig--control-name control)
-                                    ham-rig-control-value-labels))))
-      (cdr (assoc value (ham-rig--control-values control)))
+word for it, then the manufacturer\='s, then whatever the rig called it."
+  (or (ham-rig--local-value-label control value)
+      (ham-rig--value-assoc value (ham-rig--control-values control))
       (and (equal (ham-rig--control-name control) "AGC")
-           (cdr (assoc value (ham-rig--agc-settings))))))
+           (ham-rig--value-assoc value (ham-rig--agc-settings)))))
 
 (defun ham-rig--control-watts-p (control)
   "Return non-nil if CONTROL is a level whose unit is watts.
@@ -2393,7 +2679,107 @@ With COALESCE, supersede any read of the same control already queued."
       (if coalesce
           (ham-rig--enqueue-latest "m" "m" #'ham-rig--note-mode)
         (ham-rig--enqueue "m" #'ham-rig--note-mode kind))
-    (ham-rig--read-level-or-func control kind coalesce)))
+    (if-let ((raw (ham-rig--raw-function control)))
+        (ham-rig--read-raw-function control raw kind coalesce)
+      (ham-rig--read-level-or-func control kind coalesce))))
+
+
+;;;; Switches Hamlib gets wrong
+
+(defun ham-rig--raw-function (control)
+  "Return the raw CAT commands for CONTROL on this model, or nil.
+See `ham-rig-model-raw-functions'."
+  (and (eq (ham-rig--control-kind control) 'func)
+       (cdr (assoc (ham-rig--control-name control)
+                   (cdr (cl-assoc (string-trim
+                                   (or (ham-rig--caps-value "Model name") ""))
+                                  ham-rig-model-raw-functions
+                                  :test #'cl-equalp))))))
+
+(defun ham-rig--raw-reply (response)
+  "Return the radio's own answer carried in RESPONSE to a raw command."
+  (string-trim (or (ham-rig--labelled-val response "Reply") "")))
+
+(defun ham-rig--read-raw-function (control raw kind coalesce &optional wanted)
+  "Queue a read of CONTROL through RAW, its raw CAT commands.
+
+KIND and COALESCE are as for `ham-rig--read-control'.  WANTED, after a
+change, is a list holding the state asked for: the read then says
+whether it was reached, and why not if it was not."
+  (let* ((command (format "W %s ;" (plist-get raw :read)))
+         (callback
+          (lambda (r)
+            (let* ((reply (ham-rig--raw-reply r))
+                   (state (cond ((equal reply (plist-get raw :on)) t)
+                                ((equal reply (plist-get raw :off)) nil)
+                                (t 'unknown))))
+              (ham-rig--set-control-value control state)
+              (when wanted
+                (let ((value (car wanted)))
+                  (cond
+                   ((not (zerop (ham-rig-response-rc r)))
+                    (ham-rig--note-write-result control value
+                                                (ham-rig-response-rc r)))
+                   ((eq state 'unknown)
+                    (ham-rig--note-failure
+                     control value
+                     (if (equal reply "?;")
+                         (format "the rig did not understand %s"
+                                 (plist-get raw :read))
+                       (format "the rig answered %s to %s" reply
+                               (plist-get raw :read)))))
+                   ((not (eq state (and value t)))
+                    (ham-rig--note-failure
+                     control value
+                     (format "the rig did not take %s"
+                             (plist-get raw (if value :on :off)))))
+                   (t (ham-rig--clear-failure control)))))))))
+    (if coalesce
+        (ham-rig--enqueue-latest command command callback)
+      (ham-rig--enqueue command callback kind))))
+
+(defun ham-rig--write-raw-function (control raw value)
+  "Switch CONTROL to VALUE through RAW, its raw CAT commands, and read it back.
+
+Sent with `W\\=' and no reply expected, since a Yaesu answers a set with
+nothing.  Plain `w\\=' waits for an answer regardless and gives up after
+two seconds, and the radio refusing the command shows only as a `?;'
+that rigctld then flushes -- so the read that follows is what says
+whether it worked."
+  (ham-rig--enqueue
+   (format "W %s 0" (plist-get raw (if value :on :off)))
+   (lambda (r)
+     (unless (zerop (ham-rig-response-rc r))
+       (ham-rig--note-write-result control value (ham-rig-response-rc r)))))
+  (ham-rig--read-raw-function control raw nil nil (list value)))
+
+(defun ham-rig-send-raw (command)
+  "Send COMMAND to the radio as it stands, and show its answer.
+
+For finding out what a radio makes of a CAT command, or what state it
+reports, without Hamlib translating either way.  COMMAND is in the
+radio's own protocol, such as PR0; on a Yaesu.  It goes through
+rigctld, so nothing else needs the serial port, and the answer is read
+up to the next semicolon, which suits Yaesu and Kenwood.  A command the
+radio answers with nothing waits until rigctld gives up, which is the
+answer too."
+  (interactive "sCAT command (e.g. PR0;): ")
+  (unless (ham-rig-connected-p)
+    (user-error "Not connected to rigctld"))
+  (when (string-match-p "[ \t]" command)
+    (user-error "A command containing spaces cannot pass through rigctld"))
+  (let ((command (if (string-suffix-p ";" command) command (concat command ";"))))
+    (ham-rig--enqueue
+     (format "W %s ;" command)
+     (lambda (r)
+       (let ((reply (ham-rig--raw-reply r))
+             (rc (ham-rig-response-rc r)))
+         (message "ham-rig: %s -> %s" command
+                  (cond ((not (zerop rc))
+                         (format "%s (RPRT %d)" (ham-rig--describe-rc rc) rc))
+                        ((string-empty-p reply) "no answer")
+                        ((equal reply "?;") "?; (not understood)")
+                        (t reply))))))))
 
 (defun ham-rig--read-level-or-func (control kind coalesce)
   "Queue a read of CONTROL, an ordinary level or function.
@@ -2491,22 +2877,37 @@ rig was not changed.  Without looking at it, a refused change showed
 on the panel for as long as it took the read that follows to bring the
 old value back, and then quietly reverted -- which looks exactly like
 the panel being broken, when the panel was the one part working."
-  (let ((name (ham-rig--control-name control)))
-    (if (zerop rc)
-        (when (gethash name ham-rig--control-failures)
-          (remhash name ham-rig--control-failures)
-          (setq ham-rig--controls-dirty t)
-          (ham-rig--schedule-controls-redisplay))
-      (let ((why (format "%s (RPRT %d)" (ham-rig--describe-rc rc) rc)))
-        (puthash name why ham-rig--control-failures)
-        (setq ham-rig--controls-dirty t)
-        (ham-rig--schedule-controls-redisplay)
-        (message "ham-rig: %s was not set to %s: %s"
-                 (ham-rig--control-label control)
-                 (if (eq (ham-rig--control-kind control) 'func)
-                     (if value "on" "off")
-                   (ham-rig--format-level control value))
-                 why)))))
+  (if (zerop rc)
+      (ham-rig--clear-failure control)
+    (ham-rig--note-failure
+     control value (format "%s (RPRT %d)" (ham-rig--describe-rc rc) rc))))
+
+(defun ham-rig--failure-key (control)
+  "Return the key CONTROL's failures are kept under.
+Kind as well as name: an FTDX10 has a COMP level, the processor's
+level, and a COMP function, the processor's switch, and a failure of
+one is not a failure of the other."
+  (cons (ham-rig--control-kind control) (ham-rig--control-name control)))
+
+(defun ham-rig--clear-failure (control)
+  "Forget that the last change to CONTROL failed."
+  (let ((key (ham-rig--failure-key control)))
+    (when (gethash key ham-rig--control-failures)
+      (remhash key ham-rig--control-failures)
+      (setq ham-rig--controls-dirty t)
+      (ham-rig--schedule-controls-redisplay))))
+
+(defun ham-rig--note-failure (control value why)
+  "Record and report that CONTROL was not set to VALUE, because of WHY."
+  (puthash (ham-rig--failure-key control) why ham-rig--control-failures)
+  (setq ham-rig--controls-dirty t)
+  (ham-rig--schedule-controls-redisplay)
+  (message "ham-rig: %s was not set to %s: %s"
+           (ham-rig--control-label control)
+           (if (eq (ham-rig--control-kind control) 'func)
+               (if value "on" "off")
+             (ham-rig--format-level control value))
+           why))
 
 (defun ham-rig--send-control (control value match command)
   "Send COMMAND to set CONTROL to VALUE, superseding MATCH.
@@ -2531,12 +2932,15 @@ outcome, so the control is read once more."
   "Send VALUE for CONTROL, then read it back to see what the rig did."
   (unless (ham-rig-connected-p)
     (user-error "Not connected to rigctld"))
-  (let ((name (ham-rig--control-name control)))
+  (let ((name (ham-rig--control-name control))
+        (raw (ham-rig--raw-function control)))
     (if (eq (ham-rig--control-kind control) 'func)
         (progn
           (ham-rig--set-control-value control (and value t))
-          (ham-rig--send-control control value (format "U %s" name)
-                                 (format "U %s %d" name (if value 1 0))))
+          (if raw
+              (ham-rig--write-raw-function control raw value)
+            (ham-rig--send-control control value (format "U %s" name)
+                                   (format "U %s %d" name (if value 1 0)))))
       (let ((clamped (ham-rig--acceptable-value control value)))
         (ham-rig--set-control-value control clamped)
         (if (eq (ham-rig--control-kind control) 'width)
@@ -2552,8 +2956,10 @@ outcome, so the control is read once more."
                        (format "%d" (round clamped))
                      (format "%f" clamped)))))))
     ;; Read back what the rig actually accepted, coalesced so that
-    ;; holding a key does not queue a confirmation per repeat.
-    (ham-rig--read-control control nil t)))
+    ;; holding a key does not queue a confirmation per repeat.  A raw
+    ;; switch has read itself back already, and said how it went.
+    (unless raw
+      (ham-rig--read-control control nil t))))
 
 
 ;;;; Controls polling
@@ -2619,7 +3025,16 @@ stare at a screen of dashes."
                    (max (if discrete (car (last discrete))
                           (ham-rig--control-max control)))
                    (span (- max min))
-                   (fraction (and value (> span 0) (/ (- value min) (float span)))))
+                   ;; A switch moves a step per position, however its
+                   ;; values are spaced: the FTDX10's roofing filters
+                   ;; are 1, 2, 4 and 5, and its AGC settings 0, 2, 3,
+                   ;; 5 and 6.
+                   (index (and value discrete (cdr discrete)
+                               (cl-position value discrete :test #'=)))
+                   (fraction (cond
+                              (index (/ index (float (1- (length discrete)))))
+                              ((and value (> span 0))
+                               (/ (- value min) (float span))))))
               (concat
                (format "  %-18s " (ham-rig--control-label control))
                (ham-rig--bar fraction ham-rig-controls-meter-width)
@@ -2635,7 +3050,7 @@ stare at a screen of dashes."
                           (ham-rig--format-level control min t)
                           (ham-rig--format-level control max t)))
                 'face 'ham-rig-label)))))
-         (failure (gethash (ham-rig--control-name control)
+         (failure (gethash (ham-rig--failure-key control)
                            ham-rig--control-failures)))
     ;; Left on the line until a change goes through, so that a control
     ;; the rig will not take says so rather than just not moving.

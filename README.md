@@ -2,9 +2,10 @@
 
 Amateur radio support for Emacs, by K6SM.
 
-**`ham-rig.el`** is a transceiver control panel. It shows frequency, band, mode,
-passband, VFO, split and tuning step; an S-meter while receiving; and power,
-ALC, compression, SWR and supply voltage and current while transmitting. A
+**`ham-rig.el`** is a transceiver control panel. It shows both VFOs' frequency
+and mode, passband, split, tuner, the receive front end and tuning step; an
+S-meter while receiving; and power, ALC, compression, SWR and supply voltage
+and current while transmitting. A
 second panel adjusts every level and switch the radio offers. It speaks to the
 radio through Hamlib's `rigctld`, and publishes what it sees on an event bus so
 other packages can follow the radio.
@@ -93,20 +94,27 @@ emulation, which gives you LAN remote operation with wfview carrying the audio.
 `M-x ham-rig` opens the panel and connects.
 
 ```
-  FTDX-10   connected   localhost:4532
+  FTDX-10  localhost:4532  connected
 
-  14.074.000   20m   STEP 1 k
-  7.074.000   40m    VFOB USB
+  VFOA   USB      14.074.000   STEP 1 k
+  VFOB   USB      7.074.000
 
-  VFO VFOA    MODE USB       BW 2400 Hz   SPLIT off
+  ATU OFF     BW 2400 Hz    SPLIT off
+  IPO         ATT OFF       ROOF 3 kHz    AGC AUTO
 
   RX  ████▏░░░░░░░░░░░░░░░░  S3
 ```
 
-The large frequency is the VFO the receiver is on. The line under it is the
-other VFO: VFO B while you are on A, VFO A after `v` swaps them, and Sub or
-Main on a rig with two receivers. In split, the VFO that transmits is marked
-`TX`.
+Each frequency line opens with its VFO and mode. The large frequency is
+the VFO the receiver is on, and stays on top. The line under it is the other
+VFO: VFO B while you are on A, VFO A after `v` swaps them, and Sub or Main on
+a rig with two receivers. In split, the VFO that transmits is marked `TX`.
+
+Below them are the tuner, filter width and split, and under those the receive
+front end the way the FTDX10's display shows it: preamp (IPO, AMP1, AMP2),
+attenuator, roofing filter and AGC. The two rows share columns. Each column is
+sized for the widest value it can hold, so the panel does not shift when a
+setting changes, or when the mode changes from USB to PKTUSB.
 
 | Key | Action |
 | --- | --- |
@@ -143,10 +151,54 @@ shows both.
 `ham-rig-show-other-vfo` overrides that: `t` shows it on any rig, `nil` on
 none. `ham-rig-other-vfo` returns it as `("VFOB" 7074000 "USB")`.
 
+### Front-end indicators
+
+`ham-rig-panel-indicators` chooses them, in order, as `(HAMLIB-NAME . LABEL)`.
+The default is preamp, attenuator, roofing filter and AGC. Only the ones the
+rig has appear, and any level or switch from the controls panel can be added:
+
+```elisp
+(add-to-list 'ham-rig-panel-indicators '("NB" . "NB") t)
+```
+
+An entry with no label (the preamp, by default) shows a named value alone, so
+a Yaesu shows `AMP1` rather than `PREAMP AMP1`. Those names come from
+`ham-rig-manufacturer-value-labels`, which covers Yaesu's preamp, and from
+`ham-rig-control-value-labels`, which overrides it. A rig without names for
+its values shows `PREAMP 10 dB`.
+
+The indicators are read two per slow poll (`ham-rig-indicator-poll-batch`),
+and all at once on connecting and on `g`. A change made from the controls
+panel shows immediately; one made at the radio shows within a few seconds.
+
+**The FTDX10's roofing filters are corrected automatically.** Hamlib's
+FTDX10 table was adapted from the FTDX101's, whose filters are 12 kHz, 3 kHz,
+1.2 kHz, 600 Hz and 300 Hz. The 1.2 kHz entry was removed and 600 Hz became
+500 Hz, but the codes kept their places, so the FTDX10's codes skip 3. The
+names Hamlib publishes for them were written as a list with no gap, and from
+500 Hz on every name is one off:
+
+| Code Hamlib sends | Filter it selects | Hamlib's name for the code |
+|---|---|---|
+| 1 | 12 kHz | 12 kHz |
+| 2 | 3 kHz | 3 kHz |
+| 3 | (none: falls through to the last entry, 300 Hz) | 500 Hz |
+| 4 | 500 Hz | 300 Hz (optional) |
+| 5 | 300 Hz | (no name) |
+
+The radio also never reports Hamlib's first entry, AUTO. So for an FTDX-10,
+ham-rig replaces Hamlib's list with the radio's four filters under the codes
+Hamlib actually sends and reads: 12 kHz, 3 kHz, 500 Hz and 300 Hz. The panel
+and the controls panel both use it, and choosing a filter selects that filter.
+This is in `ham-rig-model-control-values`, which can correct any other model
+the same way. It is present in every Hamlib version up to and including 4.7.2
+and its development branch; checked against the source, and by driving 4.5.5
+and 4.7.2 against a simulated FTDX10.
+
 ### Tuning
 
 `↑` and `↓` tune by the current step; `←` and `→` change the step, which is
-shown beside the band. Steps run from 1 Hz to 1 MHz, set by
+shown beside the frequency. Steps run from 1 Hz to 1 MHz, set by
 `ham-rig-tuning-steps` and `ham-rig-default-tuning-step`.
 
 The readout moves on the keypress and the next poll corrects it to what the
@@ -289,8 +341,9 @@ Hamlib reports most levels as a fraction rather than in the radio's own units.
 
 Two limits are worth knowing:
 
-- Hamlib names a preamp position `10dB`, not `AMP1`. Supply your radio's words
-  with `ham-rig-control-value-labels` and `ham-rig-control-labels`:
+- Hamlib names a preamp position `10dB`, not `AMP1`. Yaesu's words are built
+  in (`ham-rig-manufacturer-value-labels`); supply your radio's own with
+  `ham-rig-control-value-labels` and `ham-rig-control-labels`:
 
   ```elisp
   (setq ham-rig-control-value-labels
@@ -336,15 +389,57 @@ the same simulated FTDX10:
 | RF gain | Never set. The command goes out as `RG`, cut short by a NUL byte where the VFO digit belongs, and the radio refuses it (`RPRT -5`). | `RG0nnn;` |
 | Monitor level | Set out of 100 but read back out of 255: set 50%, read 20%. Each press moves it further down. | Correct. |
 | NB level | 1 to 10 are all sent as 10, and read back as 1. | Correct. |
-| VOX delay | Set correctly, read back as a tenth of the value. | Correct. |
+| VOX delay | Set as the manual's two-digit code, read back as a tenth of the value. | Correct. |
 
 Upgrading Hamlib fixes all four. The Windows installer is at
 [hamlib.github.io](https://hamlib.github.io/).
 
-One more is unconfirmed. For the speech processor (the `COMP` switch, not
-the `COMP` level), every version checked sends an FTDX10 `PR1;`, where its
-sibling models get `PR01;`. If that switch reports `not set`, that is the
-likely cause.
+**The speech processor switch on an FTDX10 is handled by ham-rig.** For the
+`COMP` switch (not the `COMP` level beside it), every Hamlib version up to
+and including 4.7.2 and its development branch sends an FTDX10 `PR1;` to
+switch it and `PR;` to read it. The radio answers `?;` to both, which shows
+as `--` and as `not set: … (RPRT -14)`. Yaesu's CAT reference gives `PR`,
+then `0` for the speech processor (`1` is the parametric microphone
+equaliser), then `1` for OFF or `2` for ON: `PR02;` switches it on, `PR01;`
+off, and `PR0;` reads it. Hamlib's `PR1;` is the equaliser with no state,
+and `PR;` a read with nothing to read.
+
+So for an FTDX-10, ham-rig switches and reads it itself with the manual's
+commands, passing them to the radio through rigctld's `W` (raw command). A change is read
+back, so if the radio does not take it, the line says so. This is in
+`ham-rig-model-raw-functions`, which can correct a switch on another model the
+same way.
+
+`M-x ham-rig-send-raw` sends any CAT command the same way and shows the
+radio's answer, for checking what a radio makes of a command without Hamlib
+in between: `PR0;` answers `PR01;` (off) or `PR02;` (on), and `PR1;`
+answers `?;`.
+
+### Checked against Yaesu's CAT reference
+
+Everything the panels send an FTDX10, through Hamlib or directly, has been
+compared with Yaesu's *FTDX10 CAT Operation Reference Manual* (2308-F):
+
+| Control | Command | Agrees with the manual |
+|---|---|---|
+| Frequency, mode, VFO, split | `FA` `FB` `MD0` `VS` `ST` `FT` | Yes |
+| RF gain, AF gain | `RG0` / `AG0` 000–255 | Yes, from Hamlib 4.6 (4.5.x sends `RG` cut short) |
+| Preamp | `PA0` 0 IPO, 1 AMP1, 2 AMP2 | Yes, and ham-rig uses Yaesu's names |
+| Attenuator | `RA0` 0 OFF, 1–3 6/12/18 dB | Yes |
+| AGC | set `GT0` 0–4; answered 0–6, 4–6 being AUTO-FAST/MID/SLOW | Yes; Hamlib reads all three as AUTO |
+| Roofing filter | set `RF0` 1/2/4/5; answered 6/7/9/A; no 3 | Yes, with ham-rig's correction of Hamlib's names |
+| Tuner | `AC00` 0 off, 1 on, 2 tune | Yes |
+| Speech processor | `PR0` 1 OFF, 2 ON | Yes, sent by ham-rig; Hamlib's `PR1;` does not |
+| Processor level, mic gain, power | `PL` / `MG` 000–100, `PC` 005–100 | Yes |
+| Monitor level | `ML1` 000–100 | Yes, from Hamlib 4.6 |
+| NB level, DNR level | `NL0` 000–010, `RL0` 01–15 | Yes, from Hamlib 4.6 |
+| Break-in delay | `SD` 00–33 | Yes |
+| IF shift, notch, contour/APF | `IS0`, `BP0`, `CO0` | Yes |
+| Power on | dummy `PS1;`, then `PS1;` within 1–2 seconds | Yes (USB only; not over RS-232C) |
+
+One is ambiguous in the manual itself: **VOX delay** (`VD`) lists two-digit
+codes (00 = 30 ms … 33 = 3000 ms) but draws four digit positions. Hamlib sends
+the two-digit code. `M-x ham-rig-send-raw` `VD;` shows which the radio uses.
 
 ### Filter width
 
@@ -1171,6 +1266,11 @@ argued about.
 | `ham-rig-fast-interval` | `0.2` | Seconds between frequency, PTT and meter polls |
 | `ham-rig-slow-interval` | `1.0` | Seconds between mode, VFO, split and other-VFO polls |
 | `ham-rig-show-other-vfo` | `auto` | Show the other VFO: when readable directly, always, or never |
+| `ham-rig-panel-indicators` | preamp, ATT, roofing, AGC | Settings shown on the rig panel |
+| `ham-rig-indicator-poll-batch` | `2` | Indicators read on each slow poll |
+| `ham-rig-manufacturer-value-labels` | Yaesu preamp | Front-panel names for values, by manufacturer |
+| `ham-rig-model-control-values` | FTDX-10 roofing filters | A control's positions on a model, replacing Hamlib's |
+| `ham-rig-model-raw-functions` | FTDX-10 processor | Switches read and set with raw CAT commands on a model |
 | `ham-rig-tx-timeout` | `180` | Watchdog unkey when the duration is unknown |
 | `ham-rig-tx-timeout-max` | `600` | Ceiling on the watchdog, whatever is declared |
 | `ham-rig-tx-watchdog-margin` | `1.25` | Allowance over a declared duration |
